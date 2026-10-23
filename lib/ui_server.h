@@ -747,9 +747,21 @@ static esp_err_t h_prov(httpd_req_t *req) {
   return ESP_OK;
 }
 
+// Регистрация маршрута с проверкой результата: при переполнении таблицы
+// обработчиков (ESP_ERR_HTTPD_HANDLERS_FULL) маршрут иначе пропадает молча,
+// и клиент получает HTTP 404.
+inline void reg_uri(httpd_handle_t srv, const httpd_uri_t &u) {
+  const esp_err_t err = httpd_register_uri_handler(srv, &u);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG_UI, "register %s failed: %s", u.uri, esp_err_to_name(err));
+  }
+}
+
 inline void start(int port) {
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port = port;
+  // По умолчанию 8 обработчиков; у нас 12 маршрутов, лишние тихо отбрасывались (404)
+  cfg.max_uri_handlers = 16;
   // web_server ESPHome больше не используется, но порт управления оставляем отдельным
   cfg.ctrl_port = 32769;
   // Стек по умолчанию (4 КБ) переполняется в обработчике сканирования
@@ -762,15 +774,15 @@ inline void start(int port) {
 
   httpd_uri_t u = {};
   u.uri = "/"; u.method = HTTP_GET; u.handler = h_root;
-  httpd_register_uri_handler(srv, &u);
+  reg_uri(srv, u);
 
   u = {};
   u.uri = "/status"; u.method = HTTP_GET; u.handler = h_status;
-  httpd_register_uri_handler(srv, &u);
+  reg_uri(srv, u);
 
   u = {};
   u.uri = "/peer_identity"; u.method = HTTP_GET; u.handler = h_peer_identity;
-  httpd_register_uri_handler(srv, &u);
+  reg_uri(srv, u);
 
   if (peer_status_lock == nullptr) peer_status_lock = xSemaphoreCreateMutex();
   if (peer_status_lock != nullptr) {
@@ -781,39 +793,39 @@ inline void start(int port) {
 
   u = {};
   u.uri = "/scan"; u.method = HTTP_GET; u.handler = h_scan;
-  httpd_register_uri_handler(srv, &u);
+  reg_uri(srv, u);
 
   u = {};
   u.uri = "/connect"; u.method = HTTP_POST; u.handler = h_connect;
-  httpd_register_uri_handler(srv, &u);
+  reg_uri(srv, u);
 
   u = {};
   u.uri = "/open"; u.method = HTTP_POST; u.handler = h_open;
-  httpd_register_uri_handler(srv, &u);
+  reg_uri(srv, u);
 
   u = {};
   u.uri = "/reset"; u.method = HTTP_POST; u.handler = h_reset;
-  httpd_register_uri_handler(srv, &u);
+  reg_uri(srv, u);
 
   u = {};
   u.uri = "/peer_reset"; u.method = HTTP_POST; u.handler = h_peer_reset;
-  httpd_register_uri_handler(srv, &u);
+  reg_uri(srv, u);
 
   u = {};
   u.uri = "/prov"; u.method = HTTP_POST; u.handler = h_prov;
-  httpd_register_uri_handler(srv, &u);
+  reg_uri(srv, u);
 
   u = {};
   u.uri = "/zero"; u.method = HTTP_POST; u.handler = h_zero;
-  httpd_register_uri_handler(srv, &u);
+  reg_uri(srv, u);
 
   u = {};
   u.uri = "/calib"; u.method = HTTP_POST; u.handler = h_calib;
-  httpd_register_uri_handler(srv, &u);
+  reg_uri(srv, u);
 
   u = {};
   u.uri = "/curve_reset"; u.method = HTTP_POST; u.handler = h_curve_reset;
-  httpd_register_uri_handler(srv, &u);
+  reg_uri(srv, u);
 
   ESP_LOGI(TAG_UI, "UI started on port %d", port);
 }
