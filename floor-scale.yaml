@@ -24,6 +24,7 @@ esphome:
   friendly_name: scale
   includes:
     - lib/prov_crypto.h
+    - lib/prov_link.h
     - lib/wifi_probe.h
     - lib/net_role.h
     - lib/ui_server.h
@@ -31,11 +32,16 @@ esphome:
     priority: -100
     then:
       - lambda: |-
+          netrole::start_logging();
           ui::prov_key = "${prov_key_b64}";
+          ui::setup_ssid = "${prov_ssid}";
+          ui::peer_ap_ip = "192.168.4.11";
+          ui::peer_host = "floor-screen.local";
           ui::device_kind = "scale";
           ui::device_title = "Весы";
           ui::on_reset = []() {
-            id(wifi_comp)->clear_sta();
+            const bool cleared = netrole::clear_saved_sta(id(wifi_comp));
+            ESP_LOGI("reset", "persistent Wi-Fi credentials cleared=%s", cleared ? "yes" : "no");
             App.reboot();
           };
           ui::on_creds = [](const std::string &ssid, const std::string &pass) {
@@ -98,19 +104,27 @@ script:
     then:
       # Случайная задержка без блокировки основного цикла (иначе срабатывает watchdog)
       - delay: !lambda 'return esp_random() % 10000;'
-      - lambda: |-
-          std::string saved;
-          uint8_t found[6] = {0};
-          if (netrole::saved_sta(saved)) {
-            ESP_LOGI("role", "Saved network %s, keeping it", saved.c_str());
-          } else if (netrole::find_bssid("${prov_ssid}", found) &&
-                     netrole::should_join_as_client(found)) {
-            ESP_LOGI("role", "Setup network found, joining as client");
-            id(wifi_comp)->save_wifi_sta("${prov_ssid}", "${prov_password}");
-            App.reboot();
-          } else {
-            ESP_LOGI("role", "No setup network to join, staying as access point");
-          }
+      - while:
+          condition:
+            lambda: return !id(role_selected);
+          then:
+            - lambda: |-
+                std::string saved;
+                uint8_t found[6] = {0};
+                if (netrole::saved_sta(saved)) {
+                  ESP_LOGI("role", "STA config exists: ssid=%s; keeping saved connection", saved.c_str());
+                  id(role_selected) = true;
+                } else if (!netrole::find_bssid("${prov_ssid}", found)) {
+                  ESP_LOGI("role", "No peer setup AP found; will scan again");
+                } else if (netrole::should_join_as_client(found)) {
+                  ESP_LOGI("role", "Peer setup AP selected; saving setup network and rebooting as client");
+                  id(wifi_comp)->save_wifi_sta("${prov_ssid}", "${prov_password}");
+                  App.reboot();
+                } else {
+                  ESP_LOGI("role", "Peer setup AP found; MAC rule selects this device as access point");
+                  id(role_selected) = true;
+                }
+            - delay: 10s
 
 esp32:
   board: seeed_xiao_esp32c6
@@ -120,6 +134,7 @@ esp32:
     advanced:
       include_builtin_idf_components:
         - esp_http_server
+        - esp_http_client
 
 logger:
   level: INFO
@@ -160,6 +175,9 @@ wifi:
 # Встроенный web_server ESPHome отключён: страницу даёт lib/ui_server.h на порту 80.
 
 globals:
+  - id: role_selected
+    type: bool
+    initial_value: "false"
   - id: state            # 0 IDLE, 1 WAIT_STABLE, 2 RESULT
     type: int
     initial_value: "0"

@@ -18,8 +18,10 @@
 #include "esphome/components/wifi/wifi_component.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "wifi_probe.h"
 #include "prov_crypto.h"
+#include "prov_link.h"
 
 namespace ui {
 
@@ -30,9 +32,23 @@ inline uint32_t window_until = 0;           // до какого момента 
 // Фиксированный буфер: статус пишется из цикла ESPHome и читается из задачи httpd
 inline char status_buf[160] = "Ожидание";
 inline std::string prov_key;                // base64 ключ, задаётся из YAML
+inline std::string setup_ssid;
+inline std::string peer_ap_ip;
+inline std::string peer_host;
 inline std::function<void(const std::string &, const std::string &)> on_creds;
 inline std::function<void()> on_reset;
 inline esphome::wifi::WiFiComponent *wifi_comp_ptr = nullptr;  // задаётся из YAML: id(wifi_comp)
+inline SemaphoreHandle_t peer_status_lock = nullptr;
+inline bool peer_check_done = false;
+inline bool peer_check_applicable = false;
+inline bool peer_link_state = false;
+inline char peer_role_buf[64] = "";
+struct PeerCandidateCache {
+  uint8_t mac[6] = {0};
+  uint32_t checked_at = 0;
+  bool valid = false;
+};
+inline PeerCandidateCache peer_candidate_cache[ESP_WIFI_MAX_CONN_NUM] = {};
 
 // ---- устройство ----
 inline std::string device_kind = "screen";        // "screen" или "scale"
@@ -98,6 +114,8 @@ button.danger{background:#c53030}
   <div class="row"><span>Сеть</span><span id="net">...</span></div>
   <div class="row"><span>IP</span><span id="ip">...</span></div>
   <div class="row"><span>Сигнал</span><span id="sig">...</span></div>
+  <div class="row"><span>Режим пары</span><span id="role">...</span></div>
+  <div class="row"><span>Связь с устройством</span><span id="peer">...</span></div>
 </div>
 
 <div class="card" id="wcard" style="display:none">
@@ -135,6 +153,10 @@ async function refresh(){
     const r=await fetch('/status'); const j=await r.json();
     $('st').textContent=j.status; $('net').textContent=j.network;
     $('ip').textContent=j.ip; $('sig').textContent=j.signal;
+    $('role').textContent=j.role||'не определён';
+    $('peer').textContent=!j.peer_applicable ? 'ожидание сети' :
+      (!j.peer_checked ? 'проверка...' :
+        (j.peer_link ? ('подключено — '+(j.peer_role||'сосед')) : 'нет связи'));
     if(j.title) $('title').textContent=j.title;
     const isScale=(j.kind==='scale');
     $('wcard').style.display=isScale?'block':'none';
@@ -154,9 +176,12 @@ async function openWin(){
 }
 
 async function resetNet(){
-  if(!confirm('Сбросить сеть и перезагрузить устройство?')) return;
-  setBusy(true); say('Сброс сети, перезагрузка...');
-  try{ await fetch('/reset',{method:'POST'}); }catch(e){}
+  if(!confirm('Сбросить Wi-Fi на обоих устройствах и перезагрузить их?')) return;
+  setBusy(true); say('Передаю команду сброса соседнему устройству...');
+  try{
+    const r=await fetch('/reset',{method:'POST'}); const j=await r.json();
+    say(j.msg||'Сброс сети, перезагрузка...');
+  }catch(e){ say('Устройство перезагружается...'); }
 }
 
 async function scan(){
@@ -298,18 +323,142 @@ inline std::string num_json(float v) {
   return b;
 }
 
-// Состояние: режим, сеть, IP, сигнал, статус
+inline std::string local_role(std::string *connected_ssid = nullptr) {
+  wifi_ap_record_t ap = {};
+  if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+    char name[33] = {0};
+    memcpy(name, ap.ssid, 32);
+    if (connected_ssid != nullptr) *connected_ssid = name;
+    return setup_ssid == name ? "Клиент (слейв)" : "Домашняя сеть";
+  }
+  wifi_mode_t mode = WIFI_MODE_NULL;
+  if (esp_wifi_get_mode(&mode) == ESP_OK && (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA))
+    return "Точка доступа (мастер)";
+  return "Ожидание сети";
+}
+
+inline bool read_identity(const std::string &ip, const std::string &expected_kind,
+                          std::string &role) {
+  std::string response;
+  if (!prov_link::get_request("http://" + ip + "/peer_identity", response)) return false;
+  const std::string kind_field = "\"kind\":\"" + expected_kind + "\"";
+  if (response.find(kind_field) == std::string::npos) return false;
+  const std::string key = "\"role\":\"";
+  size_t pos = response.find(key);
+  if (pos != std::string::npos) {
+    pos += key.size();
+    size_t end = response.find('"', pos);
+    if (end != std::string::npos) role = response.substr(pos, end - pos);
+  }
+  return true;
+}
+
+inline bool resolve_peer_host(std::string &ip) {
+  if (peer_host.empty()) return false;
+  std::string name = peer_host;
+  const std::string suffix = ".local";
+  if (name.size() > suffix.size() &&
+      name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
+    name.resize(name.size() - suffix.size());
+  esp_ip4_addr_t addr = {};
+  if (mdns_query_a(name.c_str(), 500, &addr) != ESP_OK) return false;
+  char value[16];
+  snprintf(value, sizeof(value), IPSTR, IP2STR(&addr));
+  ip = value;
+  return true;
+}
+
+inline bool probe_peer(std::string &peer_role) {
+  const std::string expected = device_kind == "scale" ? "screen" : "scale";
+  const std::string role = local_role();
+  if (role == "Клиент (слейв)")
+    return !peer_ap_ip.empty() && read_identity(peer_ap_ip, expected, peer_role);
+  if (role == "Домашняя сеть") {
+    std::string ip;
+    return resolve_peer_host(ip) && read_identity(ip, expected, peer_role);
+  }
+  if (role != "Точка доступа (мастер)") return false;
+
+  // В режиме мастера ищем именно веб-морду второго устройства среди клиентов
+  // DHCP, чтобы телефон, подключённый к той же AP, не считался соседом.
+  wifi_sta_list_t stations = {};
+  if (esp_wifi_ap_get_sta_list(&stations) != ESP_OK || stations.num == 0) return false;
+  esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+  if (ap_netif == nullptr) return false;
+  esp_netif_pair_mac_ip_t pairs[ESP_WIFI_MAX_CONN_NUM] = {};
+  const int count = stations.num < ESP_WIFI_MAX_CONN_NUM ? stations.num : ESP_WIFI_MAX_CONN_NUM;
+  for (int i = 0; i < count; i++) memcpy(pairs[i].mac, stations.sta[i].mac, 6);
+  if (esp_netif_dhcps_get_clients_by_mac(ap_netif, count, pairs) != ESP_OK) return false;
+  const uint32_t now = now_ms();
+  for (int i = 0; i < count; i++) {
+    if (pairs[i].ip.addr == 0) continue;
+    int cache_slot = -1;
+    for (int j = 0; j < ESP_WIFI_MAX_CONN_NUM; j++) {
+      if (peer_candidate_cache[j].valid &&
+          memcmp(peer_candidate_cache[j].mac, pairs[i].mac, 6) == 0) {
+        cache_slot = j;
+        if ((uint32_t) (now - peer_candidate_cache[j].checked_at) < 15000) break;
+        cache_slot = j;
+        break;
+      }
+      if (!peer_candidate_cache[j].valid && cache_slot < 0) cache_slot = j;
+    }
+    if (cache_slot >= 0 && peer_candidate_cache[cache_slot].valid &&
+        memcmp(peer_candidate_cache[cache_slot].mac, pairs[i].mac, 6) == 0 &&
+        (uint32_t) (now - peer_candidate_cache[cache_slot].checked_at) < 15000)
+      continue;
+    char ip[16];
+    snprintf(ip, sizeof(ip), IPSTR, IP2STR(&pairs[i].ip));
+    if (read_identity(ip, expected, peer_role)) {
+      if (cache_slot >= 0) peer_candidate_cache[cache_slot].valid = false;
+      return true;
+    }
+    if (cache_slot < 0) cache_slot = i % ESP_WIFI_MAX_CONN_NUM;
+    memcpy(peer_candidate_cache[cache_slot].mac, pairs[i].mac, 6);
+    peer_candidate_cache[cache_slot].checked_at = now;
+    peer_candidate_cache[cache_slot].valid = true;
+  }
+  return false;
+}
+
+// Проверяем соседа вне HTTP-сервера: иначе встречные запросы /status с двух
+// страниц могут занять оба HTTP server task и взаимно ждать ответа.
+inline void peer_monitor_task(void *) {
+  while (true) {
+    std::string role;
+    const std::string own_role = local_role();
+    const bool applicable = own_role == "Клиент (слейв)" ||
+                            own_role == "Точка доступа (мастер)" ||
+                            own_role == "Домашняя сеть";
+    const bool linked = applicable && probe_peer(role);
+    if (peer_status_lock != nullptr && xSemaphoreTake(peer_status_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+      peer_link_state = linked;
+      peer_check_applicable = applicable;
+      peer_check_done = true;
+      snprintf(peer_role_buf, sizeof(peer_role_buf), "%s", linked ? role.c_str() : "");
+      xSemaphoreGive(peer_status_lock);
+    }
+    vTaskDelay(pdMS_TO_TICKS(own_role == "Домашняя сеть" ? 30000 : 5000));
+  }
+}
+
+inline std::string identity_json() {
+  return "{\"kind\":\"" + device_kind + "\",\"role\":\"" +
+         json_escape(local_role().c_str()) + "\"}";
+}
+
+// Состояние сети и отдельная проверка доступности именно второго устройства.
 inline std::string status_json() {
-  std::string network = "нет", signal = "нет", ip = "нет", mode = "setup";
-  wifi_ap_record_t ap;
+  std::string network = "нет", signal = "нет", ip = "нет", connected_ssid;
+  wifi_ap_record_t ap = {};
   if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
     char name[33] = {0};
     memcpy(name, ap.ssid, 32);
     network = name;
     signal = std::to_string((int) ap.rssi) + " dBm";
-    mode = "home";
+    connected_ssid = name;
   }
-  const char *ifkey = (mode == "home") ? "WIFI_STA_DEF" : "WIFI_AP_DEF";
+  const char *ifkey = connected_ssid.empty() ? "WIFI_AP_DEF" : "WIFI_STA_DEF";
   esp_netif_t *netif = esp_netif_get_handle_from_ifkey(ifkey);
   esp_netif_ip_info_t ipi = {};
   if (netif != nullptr && esp_netif_get_ip_info(netif, &ipi) == ESP_OK && ipi.ip.addr != 0) {
@@ -319,13 +468,27 @@ inline std::string status_json() {
   }
   std::string out = "{";
   out += "\"status\":\"" + json_escape(status_buf) + "\",";
-  out += "\"mode\":\"" + mode + "\",";
+  out += "\"role\":\"" + json_escape(local_role().c_str()) + "\",";
   out += "\"network\":\"" + json_escape(network.c_str()) + "\",";
   out += "\"ip\":\"" + ip + "\",";
   out += "\"signal\":\"" + signal + "\",";
   out += std::string("\"window\":") + (window_open() ? "true" : "false");
   out += ",\"kind\":\"" + device_kind + "\"";
   out += ",\"title\":\"" + json_escape(device_title.c_str()) + "\"";
+  bool checked = false, applicable = false, linked = false;
+  char peer_role[sizeof(peer_role_buf)] = "";
+  if (peer_status_lock != nullptr && xSemaphoreTake(peer_status_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
+    checked = peer_check_done;
+    applicable = peer_check_applicable;
+    linked = peer_link_state;
+    memcpy(peer_role, peer_role_buf, sizeof(peer_role));
+    peer_role[sizeof(peer_role) - 1] = '\0';
+    xSemaphoreGive(peer_status_lock);
+  }
+  out += std::string(",\"peer_checked\":") + (checked ? "true" : "false");
+  out += std::string(",\"peer_applicable\":") + (applicable ? "true" : "false");
+  out += std::string(",\"peer_link\":") + (linked ? "true" : "false");
+  if (linked) out += ",\"peer_role\":\"" + json_escape(peer_role) + "\"";
   if (extra_status) out += "," + extra_status();
   out += "}";
   return out;
@@ -339,6 +502,12 @@ static esp_err_t h_root(httpd_req_t *req) {
 static esp_err_t h_status(httpd_req_t *req) {
   std::string s = status_json();
   httpd_resp_set_type(req, "application/json; charset=utf-8");
+  return httpd_resp_send(req, s.c_str(), s.size());
+}
+
+static esp_err_t h_peer_identity(httpd_req_t *req) {
+  const std::string s = identity_json();
+  httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, s.c_str(), s.size());
 }
 
@@ -460,7 +629,7 @@ static esp_err_t h_curve_reset(httpd_req_t *req) {
   return queue_cmd(req, "curve_reset", 0.0f, (bool) on_curve_reset);
 }
 
-// Проверка пароля без передачи соседу
+// Проверка сети и передача зашифрованных учётных данных соседу.
 static esp_err_t h_connect(httpd_req_t *req) {
   std::string b;
   httpd_resp_set_type(req, "application/json; charset=utf-8");
@@ -472,10 +641,41 @@ static esp_err_t h_connect(httpd_req_t *req) {
   if (ssid.empty()) {
     return httpd_resp_sendstr(req, "{\"ok\":false,\"msg\":\"Выберите сеть\"}");
   }
-  if (probe::try_connect(ssid, pass, 15000)) {
-    return httpd_resp_sendstr(req,
-        "{\"ok\":true,\"msg\":\"Подключение успешно, креды готовы к отправке\"}");
+  wifi_config_t previous = {};
+  const bool have_previous = esp_wifi_get_config(WIFI_IF_STA, &previous) == ESP_OK;
+  const bool was_setup_client = have_previous && setup_ssid.size() > 0 &&
+      strncmp((const char *) previous.sta.ssid, setup_ssid.c_str(), 32) == 0;
+
+  bool previous_network_restored = false;
+  if (probe::try_connect(ssid, pass, 15000, &previous_network_restored)) {
+    if (!previous_network_restored) {
+      set_status("Сеть проверена, но связь с соседом не восстановилась");
+      return httpd_resp_sendstr(req,
+          "{\"ok\":false,\"msg\":\"Сеть подходит, но устройство не вернулось в setup-сеть. Проверьте связь с соседом и повторите\"}");
+    }
+    std::string blob;
+    if (!prov::encrypt(prov_key.c_str(), ssid, pass, blob)) {
+      set_status("Ошибка шифрования учётных данных");
+      return httpd_resp_sendstr(req,
+          "{\"ok\":false,\"msg\":\"Не удалось зашифровать учётные данные\"}");
+    }
+
+    const bool sent = was_setup_client
+        ? prov_link::send_to_peer_ap(peer_ap_ip, blob)
+        : prov_link::send_to_ap_clients(blob);
+    if (!sent) {
+      set_status("Сеть проверена, сосед не принял настройки");
+      return httpd_resp_sendstr(req,
+          "{\"ok\":false,\"msg\":\"Сеть работает, но сосед не найден или его окно настройки закрыто. Откройте окно на втором устройстве и повторите\"}");
+    }
+
+    set_status("Сосед принял настройки, подключение к сети");
+    httpd_resp_sendstr(req,
+        "{\"ok\":true,\"msg\":\"Сосед принял настройки. Устройство подключается к сети\"}");
+    if (on_creds) on_creds(ssid, pass);
+    return ESP_OK;
   }
+  set_status("Не удалось подключиться, проверьте пароль");
   return httpd_resp_sendstr(req,
       "{\"ok\":false,\"msg\":\"Не удалось подключиться, проверьте пароль\"}");
 }
@@ -488,9 +688,38 @@ static esp_err_t h_open(httpd_req_t *req) {
 }
 
 static esp_err_t h_reset(httpd_req_t *req) {
-  set_status("Сброс сети, перезагрузка");
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_sendstr(req, "{\"ok\":true}");
+  bool peer_reset = false;
+  if (prov::is_home_network(setup_ssid.c_str())) {
+    peer_reset = prov_link::reset_peer_at(peer_host);
+  } else {
+    wifi_config_t sta = {};
+    const bool setup_client = esp_wifi_get_config(WIFI_IF_STA, &sta) == ESP_OK &&
+        setup_ssid.size() > 0 && strncmp((const char *) sta.sta.ssid, setup_ssid.c_str(), 32) == 0;
+    peer_reset = setup_client
+        ? prov_link::reset_peer_at(peer_ap_ip)
+        : prov_link::reset_ap_clients();
+  }
+
+  const char *msg = peer_reset
+      ? "Сброс отправлен обоим устройствам, они перезагружаются"
+      : "Сосед не ответил; сбрасывается только это устройство";
+  set_status(msg);
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  std::string body = std::string("{\"ok\":true,\"peer_reset\":") +
+                     (peer_reset ? "true" : "false") +
+                     ",\"msg\":\"" + msg + "\"}";
+  httpd_resp_send(req, body.c_str(), body.size());
+  vTaskDelay(pdMS_TO_TICKS(250));
+  if (on_reset) on_reset();
+  return ESP_OK;
+}
+
+// Команда от соседа. Отвечает до сброса и не пересылает команду обратно.
+static esp_err_t h_peer_reset(httpd_req_t *req) {
+  set_status("Сосед запросил сброс сети");
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"Сброс принят\"}");
+  vTaskDelay(pdMS_TO_TICKS(500));
   if (on_reset) on_reset();
   return ESP_OK;
 }
@@ -540,6 +769,17 @@ inline void start(int port) {
   httpd_register_uri_handler(srv, &u);
 
   u = {};
+  u.uri = "/peer_identity"; u.method = HTTP_GET; u.handler = h_peer_identity;
+  httpd_register_uri_handler(srv, &u);
+
+  if (peer_status_lock == nullptr) peer_status_lock = xSemaphoreCreateMutex();
+  if (peer_status_lock != nullptr) {
+    xTaskCreate(peer_monitor_task, "peer_monitor", 8192, nullptr, 1, nullptr);
+  } else {
+    ESP_LOGE(TAG_UI, "cannot create peer status mutex");
+  }
+
+  u = {};
   u.uri = "/scan"; u.method = HTTP_GET; u.handler = h_scan;
   httpd_register_uri_handler(srv, &u);
 
@@ -553,6 +793,10 @@ inline void start(int port) {
 
   u = {};
   u.uri = "/reset"; u.method = HTTP_POST; u.handler = h_reset;
+  httpd_register_uri_handler(srv, &u);
+
+  u = {};
+  u.uri = "/peer_reset"; u.method = HTTP_POST; u.handler = h_peer_reset;
   httpd_register_uri_handler(srv, &u);
 
   u = {};

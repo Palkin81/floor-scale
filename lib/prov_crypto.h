@@ -13,6 +13,7 @@
 #include "mbedtls/base64.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
+#include "esp_random.h"
 
 namespace prov {
 
@@ -83,6 +84,55 @@ inline bool decrypt(const char *key_b64, const std::string &blob_hex,
   pass = s.substr(p1 + 1);
 
   if (ssid.empty() || ssid.size() > 32 || pass.size() > 64) return false;
+  return true;
+}
+
+// Шифрует сетевые данные для передачи соседу в том же формате, который
+// принимает POST /prov: hex(nonce | tag | ciphertext).
+inline bool encrypt(const char *key_b64, const std::string &ssid,
+                    const std::string &pass, std::string &blob_hex) {
+  if (ssid.empty() || ssid.size() > 32 || pass.size() > 64) return false;
+
+  uint8_t key[32];
+  size_t klen = 0;
+  if (mbedtls_base64_decode(key, sizeof(key), &klen,
+                            (const unsigned char *) key_b64, strlen(key_b64)) != 0 ||
+      klen != 32) {
+    ESP_LOGE(TAG_PROV, "Bad prov key (need base64 of 32 bytes)");
+    return false;
+  }
+
+  const std::string plain = ssid + "\n" + pass;
+  uint8_t nonce[12];
+  uint8_t tag[16];
+  std::vector<uint8_t> cipher(plain.size());
+  esp_fill_random(nonce, sizeof(nonce));
+
+  mbedtls_gcm_context ctx;
+  mbedtls_gcm_init(&ctx);
+  int rc = mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, key, 256);
+  if (rc == 0) {
+    rc = mbedtls_gcm_crypt_and_tag(&ctx, MBEDTLS_GCM_ENCRYPT, plain.size(),
+                                   nonce, sizeof(nonce), nullptr, 0,
+                                   (const uint8_t *) plain.data(), cipher.data(),
+                                   sizeof(tag), tag);
+  }
+  mbedtls_gcm_free(&ctx);
+  memset(key, 0, sizeof(key));
+  if (rc != 0) return false;
+
+  static const char HEX[] = "0123456789abcdef";
+  blob_hex.clear();
+  blob_hex.reserve((sizeof(nonce) + sizeof(tag) + cipher.size()) * 2);
+  auto append_hex = [&blob_hex](const uint8_t *data, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+      blob_hex += HEX[data[i] >> 4];
+      blob_hex += HEX[data[i] & 0x0f];
+    }
+  };
+  append_hex(nonce, sizeof(nonce));
+  append_hex(tag, sizeof(tag));
+  append_hex(cipher.data(), cipher.size());
   return true;
 }
 
