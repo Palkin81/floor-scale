@@ -42,9 +42,11 @@ inline bool try_connect(const std::string &ssid, const std::string &pass, int ti
                         bool *previous_network_restored = nullptr) {
   wifi_config_t old_cfg = {};
   const bool had_old_cfg = esp_wifi_get_config(WIFI_IF_STA, &old_cfg) == ESP_OK;
-  // ESP-IDF exposes a setter but no getter; FLASH is the documented default
-  // and the mode used by these ESPHome configs when saving STA credentials.
-  const wifi_storage_t old_storage = WIFI_STORAGE_FLASH;
+  // У ESP-IDF есть setter, но нет getter. ESPHome после esp_wifi_init сам
+  // переключает драйвер в WIFI_STORAGE_RAM (wifi_component_esp_idf.cpp), поэтому
+  // именно RAM и надо возвращать. Возврат FLASH заставлял драйвер записывать в
+  // NVS каждую последующую сеть, и после сброса там оставалась устаревшая запись.
+  const wifi_storage_t old_storage = WIFI_STORAGE_RAM;
 
   wifi_config_t cfg = {};
   memcpy(cfg.sta.ssid, ssid.c_str(), ssid.size() < 32 ? ssid.size() : 32);
