@@ -3,6 +3,7 @@
 // Черновик, не проверен на железе.
 
 #include <string>
+#include <atomic>
 #include <string.h>
 #include <stdio.h>
 #include "esp_wifi.h"
@@ -17,6 +18,9 @@ namespace netrole {
 
 static const char *TAG_NR = "netrole";
 inline bool logging_started = false;
+// True only after ESP-IDF confirms our fallback AP is actually running.
+// Before that, a peer AP is already established and should be preferred.
+inline std::atomic_bool own_ap_started{false};
 
 // ESPHome's clear_sta() clears only the runtime list. With no static STA
 // networks in YAML, runtime credentials use fallback preference key
@@ -70,6 +74,7 @@ inline void wifi_event_log(void *, esp_event_base_t base, int32_t id, void *data
     if (id == WIFI_EVENT_STA_START) {
       ESP_LOGI(TAG_NR, "STA started");
     } else if (id == WIFI_EVENT_AP_START) {
+      own_ap_started.store(true);
       wifi_config_t cfg = {};
       uint8_t mac[6] = {0};
       char mac_s[18];
@@ -200,16 +205,25 @@ inline bool find_bssid(const std::string &target, uint8_t out[6]) {
   return false;
 }
 
-// Роль по MAC: большая MAC становится клиентом, меньшая остаётся точкой.
-// Так два устройства, увидевшие друг друга одновременно, не окажутся оба клиентами.
+// If our fallback AP has not started yet, the discovered peer is already
+// established: join it regardless of MAC. Use MAC only to break the tie when
+// both devices independently started their fallback APs before seeing each other.
 inline bool should_join_as_client(const uint8_t found[6]) {
+  if (!own_ap_started.load()) {
+    char peer_s[18];
+    mac_text(found, peer_s);
+    ESP_LOGI(TAG_NR, "peer AP %s already active; own AP not started -> STA client",
+             peer_s);
+    return true;
+  }
+
   uint8_t own[6] = {0};
   esp_wifi_get_mac(WIFI_IF_AP, own);
   char own_s[18], peer_s[18];
   mac_text(own, own_s);
   mac_text(found, peer_s);
   const bool join = memcmp(own, found, 6) > 0;
-  ESP_LOGI(TAG_NR, "role MAC compare: own=%s peer=%s -> %s",
+  ESP_LOGI(TAG_NR, "both APs started; MAC tie-break: own=%s peer=%s -> %s",
            own_s, peer_s, join ? "STA client" : "AP");
   return join;
 }

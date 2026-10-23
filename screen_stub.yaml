@@ -55,18 +55,35 @@ script:
             - lambda: |-
                 std::string saved;
                 uint8_t found[6] = {0};
-                if (netrole::saved_sta(saved)) {
+                const bool has_saved_sta = netrole::saved_sta(saved);
+                const bool saved_setup_sta = has_saved_sta && saved == "${prov_ssid}";
+                if (has_saved_sta && !saved_setup_sta) {
                   ESP_LOGI("role", "STA config exists: ssid=%s; keeping saved connection", saved.c_str());
                   id(role_selected) = true;
-                } else if (!netrole::find_bssid("${prov_ssid}", found)) {
-                  ESP_LOGI("role", "No peer setup AP found; will scan again");
-                } else if (netrole::should_join_as_client(found)) {
-                  ESP_LOGI("role", "Peer setup AP selected; saving setup network and rebooting as client");
-                  id(wifi_comp)->save_wifi_sta("${prov_ssid}", "${prov_password}");
-                  App.reboot();
                 } else {
-                  ESP_LOGI("role", "Peer setup AP found; MAC rule selects this device as access point");
-                  id(role_selected) = true;
+                  if (saved_setup_sta) {
+                    ESP_LOGI("role", "Saved STA is setup network; checking peer AP instead of assuming connected");
+                  }
+                  if (!netrole::find_bssid("${prov_ssid}", found)) {
+                    ESP_LOGI("role", "No peer setup AP found; will scan again");
+                  } else if (netrole::should_join_as_client(found)) {
+                    if (saved_setup_sta) {
+                      ESP_LOGI("role", "Peer setup AP selected; existing STA config will connect");
+                      id(role_selected) = true;
+                    } else {
+                      ESP_LOGI("role", "Peer setup AP selected; saving setup network and rebooting as client");
+                      id(wifi_comp)->save_wifi_sta("${prov_ssid}", "${prov_password}");
+                      App.reboot();
+                    }
+                  } else if (saved_setup_sta) {
+                    ESP_LOGI("role", "MAC tie-break selects AP; clearing saved setup STA and staying AP");
+                    const bool cleared = netrole::clear_saved_sta(id(wifi_comp));
+                    ESP_LOGI("role", "saved setup STA cleared=%s", cleared ? "yes" : "no");
+                    id(role_selected) = true;
+                  } else {
+                    ESP_LOGI("role", "Peer setup AP found; MAC rule selects this device as access point");
+                    id(role_selected) = true;
+                  }
                 }
             - delay: 10s
 
@@ -105,6 +122,8 @@ wifi:
   ap:
     ssid: ${prov_ssid}
     password: ${prov_password}
+    # Start the fallback AP after 40 seconds without a successful STA connection.
+    ap_timeout: 40s
     manual_ip:
       static_ip: 192.168.4.11
       gateway: 192.168.4.11
