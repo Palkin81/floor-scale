@@ -22,6 +22,7 @@
 #include "wifi_probe.h"
 #include "prov_crypto.h"
 #include "prov_link.h"
+#include "net_role.h"
 
 namespace ui {
 
@@ -641,10 +642,11 @@ static esp_err_t h_connect(httpd_req_t *req) {
   if (ssid.empty()) {
     return httpd_resp_sendstr(req, "{\"ok\":false,\"msg\":\"Выберите сеть\"}");
   }
-  wifi_config_t previous = {};
-  const bool have_previous = esp_wifi_get_config(WIFI_IF_STA, &previous) == ESP_OK;
-  const bool was_setup_client = have_previous && setup_ssid.size() > 0 &&
-      strncmp((const char *) previous.sta.ssid, setup_ssid.c_str(), 32) == 0;
+  // Клиент ли мы setup-сети, определяем по списку сетей ESPHome, а не по
+  // конфигурации драйвера: во флеше драйвера может лежать устаревшая запись.
+  std::string sta_ssid;
+  const bool was_setup_client = netrole::saved_sta(sta_ssid) && setup_ssid.size() > 0 &&
+      sta_ssid == setup_ssid;
 
   bool previous_network_restored = false;
   if (probe::try_connect(ssid, pass, 15000, &previous_network_restored)) {
@@ -692,9 +694,9 @@ static esp_err_t h_reset(httpd_req_t *req) {
   if (prov::is_home_network(setup_ssid.c_str())) {
     peer_reset = prov_link::reset_peer_at(peer_host);
   } else {
-    wifi_config_t sta = {};
-    const bool setup_client = esp_wifi_get_config(WIFI_IF_STA, &sta) == ESP_OK &&
-        setup_ssid.size() > 0 && strncmp((const char *) sta.sta.ssid, setup_ssid.c_str(), 32) == 0;
+    std::string sta_ssid;
+    const bool setup_client = netrole::saved_sta(sta_ssid) && setup_ssid.size() > 0 &&
+        sta_ssid == setup_ssid;
     peer_reset = setup_client
         ? prov_link::reset_peer_at(peer_ap_ip)
         : prov_link::reset_ap_clients();

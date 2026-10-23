@@ -47,7 +47,13 @@ inline bool clear_saved_sta(esphome::wifi::WiFiComponent *wifi) {
 
   esp_wifi_disconnect();
   wifi_config_t empty_cfg = {};
-  const esp_err_t cfg_err = esp_wifi_set_config(WIFI_IF_STA, &empty_cfg);
+  // ESPHome держит драйвер в WIFI_STORAGE_RAM, и запись пустого конфига в RAM
+  // не затрагивает копию во флеше (nvs.net80211): после перезагрузки драйвер
+  // подгрузит из неё старую сеть. Стираем флеш-копию, временно включив FLASH,
+  // затем возвращаем RAM.
+  esp_err_t cfg_err = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+  if (cfg_err == ESP_OK) cfg_err = esp_wifi_set_config(WIFI_IF_STA, &empty_cfg);
+  esp_wifi_set_storage(WIFI_STORAGE_RAM);
   ESP_LOGI(TAG_NR, "clear saved STA: preference_erase=%s nvs=%s sync=%s driver=%s",
            pref_erased ? "ok" : "failed", esp_err_to_name(nvs_err),
            prefs_synced ? "ok" : "failed", esp_err_to_name(cfg_err));
@@ -119,17 +125,17 @@ inline void start_logging() {
            esp_err_to_name(wifi_err), esp_err_to_name(ip_err));
 }
 
-// Есть ли сохранённая клиентская сеть (домашняя или сеть настройки)
+// Есть ли сохранённая клиентская сеть (домашняя или сеть настройки).
+// Источник истины: список сетей ESPHome (его наполняет сохранённая preference
+// через save_wifi_sta), а не конфигурация драйвера ESP-IDF. Драйвер при старте
+// подгружает свой конфиг из флеша и может держать устаревшую запись, которую
+// ESPHome не использует: тогда устройство «сохранило» сеть, но к ней не
+// подключается. Пустой SSID считаем отсутствием сети.
 inline bool saved_sta(std::string &ssid) {
-  wifi_config_t cfg = {};
-  esp_err_t err = esp_wifi_get_config(WIFI_IF_STA, &cfg);
-  if (err != ESP_OK) {
-    ESP_LOGW(TAG_NR, "cannot read saved STA config: %s", esp_err_to_name(err));
-    return false;
-  }
-  char s[33] = {0};
-  memcpy(s, cfg.sta.ssid, 32);
-  ssid = s;
+  ssid.clear();
+  esphome::wifi::WiFiComponent *wifi = esphome::wifi::global_wifi_component;
+  if (wifi == nullptr || !wifi->has_sta()) return false;
+  ssid = wifi->get_sta().get_ssid().str();
   return !ssid.empty();
 }
 

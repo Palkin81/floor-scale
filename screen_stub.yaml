@@ -85,6 +85,9 @@ logger:
     component: ERROR
 
 api:
+  # Без Home Assistant клиентов устройство по умолчанию перезагружается каждые
+  # 15 минут («No clients; rebooting»), что рвёт сеть настройки. Как у весов.
+  reboot_timeout: 0s
   encryption:
     key: !secret espectre_encryption_key
 
