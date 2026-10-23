@@ -1,0 +1,16 @@
+# ESPHome local state and build outputs
+.esphome/
+**/.esphome/
+
+# Credentials and local configuration
+secrets.yaml
+**/secrets.yaml
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/

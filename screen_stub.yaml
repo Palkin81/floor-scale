@@ -1,0 +1,106 @@
+substitutions:
+  prov_key_b64: !secret espectre_encryption_key   # base64 от 32 байт, тот же что для API
+  prov_ssid: !secret prov_ssid
+  prov_password: !secret prov_password
+  window_ms: "300000"                              # окно настройки: 5 минут
+
+esphome:
+  name: floor-screen
+  friendly_name: screen
+  includes:
+    - lib/prov_crypto.h
+    - lib/wifi_probe.h
+    - lib/ui_server.h
+    - lib/net_role.h
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: pick_role
+      - lambda: |-
+          ui::prov_key = "${prov_key_b64}";
+          ui::on_reset = []() {
+            id(wifi_comp)->clear_sta();
+            App.reboot();
+          };
+          ui::on_creds = [](const std::string &ssid, const std::string &pass) {
+            id(wifi_comp)->save_wifi_sta(ssid, pass);
+            delay(1000);
+            App.reboot();
+          };
+          ui::open_window(${window_ms});
+          ui::set_status("Окно настройки открыто на 5 минут");
+          ui::wifi_comp_ptr = id(wifi_comp);
+          ui::start(80);
+
+script:
+  - id: pick_role
+    then:
+      # Случайная задержка без блокировки основного цикла (иначе срабатывает watchdog)
+      - delay: !lambda 'return esp_random() % 10000;'
+      - lambda: |-
+          std::string saved;
+          uint8_t found[6] = {0};
+          if (netrole::saved_sta(saved)) {
+            ESP_LOGI("role", "Saved network %s, keeping it", saved.c_str());
+          } else if (netrole::find_bssid("${prov_ssid}", found) &&
+                     netrole::should_join_as_client(found)) {
+            ESP_LOGI("role", "Setup network found, joining as client");
+            id(wifi_comp)->save_wifi_sta("${prov_ssid}", "${prov_password}");
+            App.reboot();
+          } else {
+            ESP_LOGI("role", "No setup network to join, staying as access point");
+          }
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    advanced:
+      include_builtin_idf_components:
+        - esp_http_server
+
+logger:
+  level: INFO
+  logs:
+    component: ERROR
+
+api:
+  encryption:
+    key: !secret espectre_encryption_key
+
+ota:
+  - platform: esphome
+    encryption:
+      key: !secret espectre_encryption_key
+
+wifi:
+  id: wifi_comp
+  # Клиентских попыток к сети настройки нет: они перезапускают адаптер и рвут точку.
+  # Сохранённая домашняя сеть подключается как раньше.
+
+  # Точка доступа для настройки
+  ap:
+    ssid: ${prov_ssid}
+    password: ${prov_password}
+    manual_ip:
+      static_ip: 192.168.4.11
+      gateway: 192.168.4.11
+      subnet: 255.255.255.0
+
+  # Подключение к домашней сети закрывает окно настройки
+  on_connect:
+    - lambda: |-
+        if (prov::is_home_network("${prov_ssid}")) {
+          ui::close_window();
+          ui::set_status("Подключено к домашней сети");
+        }
+
+  reboot_timeout: 15min
+
+# Встроенный web_server ESPHome отключён: страницу даёт lib/ui_server.h на порту 80.
+# Home Assistant пока не подключаем, работаем автономно.
+
+sensor:
+  - platform: wifi_signal
+    name: signal
+    update_interval: 30s

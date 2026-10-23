@@ -1,0 +1,33 @@
+/* Упрощённый вид для телефона. Черновик, классы web_server v3 не проверены. */
+html, body {
+  margin: 0;
+  padding: 0;
+}
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 18px;
+  line-height: 1.4;
+  padding: 12px;
+  max-width: 640px;
+  margin: 0 auto;
+}
+h1, h2 {
+  font-size: 22px;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+td {
+  padding: 10px 4px;
+  border-bottom: 1px solid #ddd;
+}
+input, button, select {
+  font-size: 18px;
+  padding: 12px;
+  width: 100%;
+  box-sizing: border-box;
+}
+button {
+  margin-top: 8px;
+}

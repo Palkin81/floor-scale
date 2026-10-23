@@ -1,0 +1,755 @@
+substitutions:
+  trigger_kg: "1.5"          # порог срабатывания, кг
+  remove_kg: "0.8"           # ниже этого считаем, что груз снят
+  hx_interval: "100ms"       # 10 Гц, RATE на GND
+  med_n: "5"                 # медиана, отсчётов (~0.5 с)
+  ema_alpha: "0.15"          # сглаживание
+  trigger_n: "3"             # отсчётов подряд выше порога (~0.3 с)
+  init_n: "30"               # ноль при загрузке, отсчётов (~3 с)
+  cal_n: "20"                # окно стабильности калибровки (~2 с)
+  stable_n: "10"             # окно стабилизации измерения (~1 с)
+  calib_ms: "1500"
+  stable_timeout_ms: "20000"
+  cal_timeout_ms: "60000"    # сколько ждать груз после калибровки
+  off_delay_ms: "10000"
+  boot_zero_tol_kg: "2.0"    # макс. расхождение нового и сохранённого нуля при старте
+  boot_zero_jitter_kg: "0.5" # макс. разброс при старте, чтобы ноль считался стабильным
+  window_ms: "300000"        # окно настройки: 5 минут
+  prov_key_b64: !secret espectre_encryption_key   # base64 от 32 байт, тот же что для API
+  prov_ssid: !secret prov_ssid
+  prov_password: !secret prov_password
+
+esphome:
+  name: floor-scale
+  friendly_name: scale
+  includes:
+    - lib/prov_crypto.h
+    - lib/wifi_probe.h
+    - lib/net_role.h
+    - lib/ui_server.h
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          ui::prov_key = "${prov_key_b64}";
+          ui::device_kind = "scale";
+          ui::device_title = "Весы";
+          ui::on_reset = []() {
+            id(wifi_comp)->clear_sta();
+            App.reboot();
+          };
+          ui::on_creds = [](const std::string &ssid, const std::string &pass) {
+            id(wifi_comp)->save_wifi_sta(ssid, pass);
+            delay(1000);
+            App.reboot();
+          };
+          ui::extra_status = []() -> std::string {
+            return "\"live\":" + ui::num_json(id(live_kg).state) +
+                   ",\"result\":" + ui::num_json(id(result_kg).state) +
+                   ",\"curve\":\"" + ui::json_escape(id(curve).state.c_str()) + "\"";
+          };
+          ui::on_zero = []() -> std::string {
+            id(cal_arm) = 0;
+            id(cal_buf).clear();
+            id(baseline) = id(last_raw);
+            id(zero_raw).make_call().set_value(id(baseline)).perform();
+            id(curve_dirty) = 1;
+            id(init_cnt) = ${init_n};
+            return "Ноль сохранён";
+          };
+          ui::on_calib = [](float known) -> std::string {
+            if (isnan(known) || known <= 0.05f) return "Укажите вес больше 0";
+            if (id(init_cnt) < ${init_n}) return "Подождите, снимается ноль";
+            id(known_kg).make_call().set_value(known).perform();
+            id(cal_buf).clear();
+            id(cal_arm) = 1;
+            id(cal_since) = millis();
+            id(state) = 0;
+            id(off_at) = 0;
+            id(display_active).publish_state(true);
+            char t[72];
+            snprintf(t, sizeof(t), "Положите %.1f кг и не двигайтесь", known);
+            return std::string(t);
+          };
+          ui::on_curve_reset = []() -> std::string {
+            id(cal_arm) = 0;
+            id(cal_buf).clear();
+            id(p1_kg).make_call().set_value(0).perform();
+            id(p1_counts).make_call().set_value(0).perform();
+            id(p2_kg).make_call().set_value(0).perform();
+            id(p2_counts).make_call().set_value(0).perform();
+            id(p3_kg).make_call().set_value(0).perform();
+            id(p3_counts).make_call().set_value(0).perform();
+            id(p4_kg).make_call().set_value(0).perform();
+            id(p4_counts).make_call().set_value(0).perform();
+            id(p5_kg).make_call().set_value(0).perform();
+            id(p5_counts).make_call().set_value(0).perform();
+            id(curve_dirty) = 1;
+            return "Кривая сброшена";
+          };
+          ui::wifi_comp_ptr = id(wifi_comp);
+          ui::open_window(${window_ms});
+          ui::set_status("Окно настройки открыто на 5 минут");
+          ui::start(80);
+      - script.execute: pick_role
+
+script:
+  - id: pick_role
+    then:
+      # Случайная задержка без блокировки основного цикла (иначе срабатывает watchdog)
+      - delay: !lambda 'return esp_random() % 10000;'
+      - lambda: |-
+          std::string saved;
+          uint8_t found[6] = {0};
+          if (netrole::saved_sta(saved)) {
+            ESP_LOGI("role", "Saved network %s, keeping it", saved.c_str());
+          } else if (netrole::find_bssid("${prov_ssid}", found) &&
+                     netrole::should_join_as_client(found)) {
+            ESP_LOGI("role", "Setup network found, joining as client");
+            id(wifi_comp)->save_wifi_sta("${prov_ssid}", "${prov_password}");
+            App.reboot();
+          } else {
+            ESP_LOGI("role", "No setup network to join, staying as access point");
+          }
+
+esp32:
+  board: seeed_xiao_esp32c6
+  variant: esp32c6
+  framework:
+    type: esp-idf
+    advanced:
+      include_builtin_idf_components:
+        - esp_http_server
+
+logger:
+  level: INFO
+  logs:
+    hx711: ERROR
+    component: ERROR
+
+api:
+  reboot_timeout: 0s
+  encryption:
+    key: !secret espectre_encryption_key
+
+ota:
+  - platform: esphome
+    encryption:
+      key: !secret espectre_encryption_key
+
+wifi:
+  id: wifi_comp
+  # Клиентских попыток к сети настройки нет: они перезапускают адаптер и рвут точку.
+  # Сохранённая домашняя сеть подключается как раньше.
+  ap:
+    ssid: ${prov_ssid}
+    password: ${prov_password}
+    manual_ip:
+      static_ip: 192.168.4.10
+      gateway: 192.168.4.10
+      subnet: 255.255.255.0
+  # Подключение к домашней сети закрывает окно настройки
+  on_connect:
+    - lambda: |-
+        if (prov::is_home_network("${prov_ssid}")) {
+          ui::close_window();
+          ui::set_status("Подключено к домашней сети");
+        }
+  reboot_timeout: 15min
+
+# Встроенный web_server ESPHome отключён: страницу даёт lib/ui_server.h на порту 80.
+
+globals:
+  - id: state            # 0 IDLE, 1 WAIT_STABLE, 2 RESULT
+    type: int
+    initial_value: "0"
+  - id: baseline         # рабочий ноль, отсчёты
+    type: float
+    initial_value: "0"
+  - id: init_cnt
+    type: int
+    initial_value: "0"
+  - id: boot_buf         # сырые отсчёты за первые ~3 с после включения
+    type: std::vector<float>
+  - id: above_n
+    type: int
+    initial_value: "0"
+  - id: since
+    type: uint32_t
+    initial_value: "0"
+  - id: off_at
+    type: uint32_t
+    initial_value: "0"
+  - id: last_raw
+    type: float
+    initial_value: "0"
+  - id: cal_arm          # 1 = ждём груз для новой точки
+    type: int
+    initial_value: "0"
+  - id: cal_since
+    type: uint32_t
+    initial_value: "0"
+  - id: curve_dirty
+    type: int
+    initial_value: "1"
+  - id: buf
+    type: std::vector<float>
+  - id: cal_buf
+    type: std::vector<float>
+
+sensor:
+  - platform: hx711
+    name: hx711_raw
+    internal: true
+    dout_pin: GPIO18     # D10
+    clk_pin: GPIO20      # D9
+    gain: 128
+    update_interval: ${hx_interval}
+    filters:
+      - median:
+          window_size: ${med_n}
+          send_every: 1
+          send_first_at: 1
+      - exponential_moving_average:
+          alpha: ${ema_alpha}
+          send_every: 1
+    on_value:
+      then:
+        - lambda: |-
+            ui::run_pending();   // команды с веб-страницы выполняются здесь, в цикле устройства
+            if (isnan(x)) return;
+            id(last_raw) = x;
+            const uint32_t now = millis();
+            auto say = [&](const std::string &s) {
+              if (id(msg).state != s) id(msg).publish_state(s);
+              ui::set_status(s);
+            };
+
+            // Окно для калибровки: последние N отсчётов
+            auto &cb = id(cal_buf);
+            cb.push_back(x);
+            if (cb.size() > ${cal_n}) cb.erase(cb.begin());
+
+            // --- Снятие нуля при включении ---
+            // Свежий ноль принимается, только если он стабилен и близок
+            // к сохранённому с прошлого раза; иначе остаётся старый.
+            if (id(init_cnt) < ${init_n}) {
+              auto &bb = id(boot_buf);
+              bb.push_back(x);
+              id(init_cnt)++;
+              if (id(init_cnt) < ${init_n}) return;
+
+              float mn = bb[0], mx = bb[0], s = 0;
+              for (float v : bb) { mn = fminf(mn, v); mx = fmaxf(mx, v); s += v; }
+              const float avg = s / bb.size();
+              const float cpk = fmaxf(1.0f, fabsf(id(scale_cnt).state));
+              const float stored_zero = id(zero_raw).state;
+              const bool have_stored = fabsf(stored_zero) > 0.5f;
+              const bool jittery = (mx - mn) > ${boot_zero_jitter_kg} * cpk;
+              const bool loaded = have_stored &&
+                  fabsf(avg - stored_zero) > ${boot_zero_tol_kg} * cpk;
+
+              if (jittery || loaded) {
+                if (have_stored) {
+                  id(baseline) = stored_zero;
+                  say(loaded
+                      ? "При включении на весах был груз — использован старый ноль"
+                      : "При включении было нестабильно — использован старый ноль");
+                  ESP_LOGW("calib", "Boot zero rejected: avg=%.0f stored=%.0f spread=%.0f",
+                           avg, stored_zero, mx - mn);
+                } else {
+                  // Старого нуля нет (первое включение) — деваться некуда
+                  id(baseline) = avg;
+                  id(zero_raw).make_call().set_value(id(baseline)).perform();
+                  ESP_LOGW("calib", "Boot zero unstable, no stored zero, accepted anyway: %.0f", avg);
+                }
+              } else {
+                id(baseline) = avg;
+                id(zero_raw).make_call().set_value(id(baseline)).perform();
+                ESP_LOGI("calib", "Boot zero %.0f", id(baseline));
+              }
+              id(curve_dirty) = 1;
+            }
+
+            float sc[5] = {id(p1_counts).state, id(p2_counts).state, id(p3_counts).state, id(p4_counts).state, id(p5_counts).state};
+            float sk[5] = {id(p1_kg).state, id(p2_kg).state, id(p3_kg).state, id(p4_kg).state, id(p5_kg).state};
+            float cs[5], ks[5];
+            int n = 0;
+            for (int i = 0; i < 5; i++) {
+              if (sk[i] > 0.05f && fabsf(sc[i]) > 500.0f) {
+                cs[n] = sc[i];
+                ks[n] = sk[i];
+                n++;
+              }
+            }
+            for (int i = 1; i < n; i++) {
+              float c = cs[i], k = ks[i];
+              int j = i - 1;
+              while (j >= 0 && ks[j] > k) {
+                cs[j + 1] = cs[j];
+                ks[j + 1] = ks[j];
+                j--;
+              }
+              cs[j + 1] = c;
+              ks[j + 1] = k;
+            }
+
+            if (id(curve_dirty)) {
+              id(curve_dirty) = 0;
+              char b[180];
+              int pos = 0;
+              if (n == 0) {
+                snprintf(b, sizeof(b), "нет точек, линейно %.0f отсч/кг", id(scale_cnt).state);
+              } else {
+                pos = snprintf(b, sizeof(b), "ноль %.0f", id(baseline));
+                for (int i = 0; i < n && pos > 0 && pos < (int) sizeof(b) - 1; i++) {
+                  pos += snprintf(b + pos, sizeof(b) - pos, " | %.1f кг", ks[i]);
+                }
+              }
+              id(curve).publish_state(b);
+            }
+
+            auto to_kg = [&](float d) -> float {
+              if (n <= 0) {
+                const float s = id(scale_cnt).state;
+                if (isnan(s) || s == 0.0f) return NAN;
+                return d / s;
+              }
+              const float slope0 = ks[0] / cs[0];
+              if (cs[0] > 0.0f && d <= 0.0f) return d * slope0;
+              if (cs[0] < 0.0f && d >= 0.0f) return d * slope0;
+              float c0 = 0.0f, k0 = 0.0f;
+              for (int i = 0; i < n; i++) {
+                const float c1 = cs[i], k1 = ks[i];
+                const bool inside = (c1 >= c0) ? (d >= c0 && d <= c1) : (d <= c0 && d >= c1);
+                if (inside) {
+                  const float dc = c1 - c0;
+                  if (fabsf(dc) < 1.0f) return k1;
+                  return k0 + (k1 - k0) * ((d - c0) / dc);
+                }
+                c0 = c1;
+                k0 = k1;
+              }
+              const float c_prev = (n >= 2) ? cs[n - 2] : 0.0f;
+              const float k_prev = (n >= 2) ? ks[n - 2] : 0.0f;
+              const float dc = c0 - c_prev;
+              if (fabsf(dc) < 1.0f) return k0;
+              return k0 + (k0 - k_prev) * ((d - c0) / dc);
+            };
+
+            const float delta = x - id(baseline);
+            const float w = to_kg(delta);
+            id(delta_counts).publish_state(delta);
+            if (!isnan(w)) id(live_kg).publish_state(w);
+
+            if (id(cal_arm)) {
+              auto &cb2 = id(cal_buf);
+              if ((int32_t) (now - id(cal_since)) > ${cal_timeout_ms}) {
+                id(cal_arm) = 0;
+                cb2.clear();
+                id(off_at) = now + ${off_delay_ms};
+                say("Калибровка отменена");
+                return;
+              }
+              if (fabsf(delta) < 1000.0f) {
+                cb2.clear();
+                return;
+              }
+              cb2.push_back(x);
+              if (cb2.size() > ${cal_n}) cb2.erase(cb2.begin());
+              if (cb2.size() < ${cal_n}) return;
+              float mn = cb2[0], mx = cb2[0], sum = 0;
+              for (float v : cb2) { mn = fminf(mn, v); mx = fmaxf(mx, v); sum += v; }
+              const float mean = sum / cb2.size();
+              const float dlt = mean - id(baseline);
+              float cpk = fabsf(id(scale_cnt).state);
+              if (n > 0 && fabsf(ks[0]) > 0.05f) cpk = fabsf(cs[0] / ks[0]);
+              float tol = cpk * 0.15f;
+              if (tol < 800.0f) tol = 800.0f;
+              if (mx - mn > tol) return;
+
+              const float known = id(known_kg).state;
+              if (isnan(known) || known <= 0.05f) {
+                id(cal_arm) = 0;
+                cb2.clear();
+                say("Укажите вес больше 0");
+                return;
+              }
+              int slot = -1;
+              const float same = fmaxf(0.15f, known * 0.01f);
+              for (int i = 0; i < 5; i++) {
+                if (sk[i] > 0.05f && fabsf(sk[i] - known) <= same) slot = i;
+              }
+              if (slot < 0) {
+                for (int i = 0; i < 5; i++) {
+                  if (sk[i] <= 0.05f) { slot = i; break; }
+                }
+              }
+              if (slot < 0) {
+                id(cal_arm) = 0;
+                cb2.clear();
+                id(off_at) = now + ${off_delay_ms};
+                say("Все 5 точек заняты");
+                return;
+              }
+              float tc[5], tk[5];
+              for (int i = 0; i < 5; i++) { tc[i] = sc[i]; tk[i] = sk[i]; }
+              tc[slot] = dlt;
+              tk[slot] = known;
+              float vc[5], vk[5];
+              int m = 0;
+              for (int i = 0; i < 5; i++) {
+                if (tk[i] > 0.05f && fabsf(tc[i]) > 500.0f) {
+                  vc[m] = tc[i];
+                  vk[m] = tk[i];
+                  m++;
+                }
+              }
+              for (int i = 1; i < m; i++) {
+                float c = vc[i], k = vk[i];
+                int j = i - 1;
+                while (j >= 0 && vk[j] > k) {
+                  vc[j + 1] = vc[j];
+                  vk[j + 1] = vk[j];
+                  j--;
+                }
+                vc[j + 1] = c;
+                vk[j + 1] = k;
+              }
+              bool ok = m > 0;
+              const int sgn = (vc[0] > 0.0f) ? 1 : -1;
+              for (int i = 0; i < m; i++) {
+                if (vc[i] * sgn <= 0.0f) ok = false;
+              }
+              for (int i = 1; i < m; i++) {
+                if ((vc[i] - vc[i - 1]) * sgn <= 500.0f) ok = false;
+              }
+              if (!ok) {
+                id(cal_arm) = 0;
+                cb2.clear();
+                id(off_at) = now + ${off_delay_ms};
+                say("Точка ломает кривую, не сохранена");
+                return;
+              }
+              switch (slot) {
+                case 0:
+                  id(p1_counts).make_call().set_value(dlt).perform();
+                  id(p1_kg).make_call().set_value(known).perform();
+                  break;
+                case 1:
+                  id(p2_counts).make_call().set_value(dlt).perform();
+                  id(p2_kg).make_call().set_value(known).perform();
+                  break;
+                case 2:
+                  id(p3_counts).make_call().set_value(dlt).perform();
+                  id(p3_kg).make_call().set_value(known).perform();
+                  break;
+                case 3:
+                  id(p4_counts).make_call().set_value(dlt).perform();
+                  id(p4_kg).make_call().set_value(known).perform();
+                  break;
+                default:
+                  id(p5_counts).make_call().set_value(dlt).perform();
+                  id(p5_kg).make_call().set_value(known).perform();
+                  break;
+              }
+              id(cal_arm) = 0;
+              cb2.clear();
+              id(curve_dirty) = 1;
+              id(off_at) = now + ${off_delay_ms};
+              char t[64];
+              snprintf(t, sizeof(t), "Точка %.1f кг сохранена (%d/5)", known, m);
+              say(t);
+              ESP_LOGI("calib", "Point %.1f kg = %.0f counts (slot %d)", known, dlt, slot + 1);
+              return;
+            }
+
+            if (isnan(w)) return;
+
+            auto to_idle = [&]() {
+              id(state) = 0;
+              id(above_n) = 0;
+              id(off_at) = now + ${off_delay_ms};
+            };
+
+            switch (id(state)) {
+              case 0: {
+                if (w > ${trigger_kg}) {
+                  if (++id(above_n) >= ${trigger_n}) {
+                    id(above_n) = 0;
+                    id(buf).clear();
+                    id(state) = 1;
+                    id(since) = now;
+                    id(off_at) = 0;
+                    id(display_active).publish_state(true);
+                    say("Встаньте ровно и не двигайтесь");
+                  }
+                } else {
+                  id(above_n) = 0;
+                }
+                if (id(state) == 0 && id(display_active).state && id(off_at) != 0 &&
+                    (int32_t) (now - id(off_at)) >= 0) {
+                  id(display_active).publish_state(false);
+                  id(off_at) = 0;
+                  say("");
+                }
+                break;
+              }
+              case 1: {
+                if (w < ${remove_kg}) { to_idle(); break; }
+                auto &b = id(buf);
+                b.push_back(w);
+                if (b.size() > ${stable_n}) b.erase(b.begin());
+                if (b.size() == ${stable_n}) {
+                  float mn = b[0], mx = b[0], sum = 0;
+                  for (float v : b) { mn = fminf(mn, v); mx = fmaxf(mx, v); sum += v; }
+                  const float tol = 0.2f + 0.001f * fabsf(w);
+                  if (mx - mn < tol) {
+                    const float mean = sum / b.size();
+                    id(result_kg).publish_state(mean);
+                    char t[48];
+                    snprintf(t, sizeof(t), "Вес: %.1f кг", mean);
+                    say(t);
+                    id(state) = 2;
+                    break;
+                  }
+                }
+                if (now - id(since) > ${stable_timeout_ms}) {
+                  say("Не удалось измерить. Сойдите и повторите");
+                  id(state) = 2;
+                }
+                break;
+              }
+              case 2: {
+                if (w < ${remove_kg}) to_idle();
+                break;
+              }
+            }
+
+  - platform: template
+    id: result_kg
+    name: result
+    unit_of_measurement: "kg"
+    device_class: weight
+    accuracy_decimals: 1
+
+  - platform: template
+    id: live_kg
+    name: live
+    unit_of_measurement: "kg"
+    device_class: weight
+    accuracy_decimals: 1
+    filters:
+      - throttle: 500ms
+
+  - platform: template
+    id: delta_counts
+    name: counts
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    filters:
+      - throttle: 1s
+
+text_sensor:
+  - platform: template
+    id: msg
+    name: message
+
+  - platform: template
+    id: curve
+    name: curve
+    entity_category: diagnostic
+
+binary_sensor:
+  - platform: template
+    id: display_active
+    name: display
+
+number:
+  - platform: template
+    id: scale_cnt
+    name: counts_per_kg
+    internal: true
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 22055
+    min_value: -10000000
+    max_value: 10000000
+    step: 1
+    mode: box
+
+  - platform: template
+    id: known_kg
+    name: known_kg
+    unit_of_measurement: "kg"
+    entity_category: config
+    optimistic: true
+    initial_value: 1.5
+    min_value: 0.1
+    max_value: 300
+    step: 0.1
+    mode: box
+
+  - platform: template
+    id: zero_raw
+    name: zero_raw
+    internal: true
+    entity_category: diagnostic
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: -10000000
+    max_value: 10000000
+    step: 1
+    mode: box
+
+  - platform: template
+    id: p1_kg
+    name: p1_kg
+    internal: true
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: 0
+    max_value: 300
+    step: 0.1
+    mode: box
+  - platform: template
+    id: p1_counts
+    name: p1_counts
+    internal: true
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: -10000000
+    max_value: 10000000
+    step: 1
+    mode: box
+
+  - platform: template
+    id: p2_kg
+    name: p2_kg
+    internal: true
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: 0
+    max_value: 300
+    step: 0.1
+    mode: box
+  - platform: template
+    id: p2_counts
+    name: p2_counts
+    internal: true
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: -10000000
+    max_value: 10000000
+    step: 1
+    mode: box
+
+  - platform: template
+    id: p3_kg
+    name: p3_kg
+    internal: true
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: 0
+    max_value: 300
+    step: 0.1
+    mode: box
+  - platform: template
+    id: p3_counts
+    name: p3_counts
+    internal: true
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: -10000000
+    max_value: 10000000
+    step: 1
+    mode: box
+
+  - platform: template
+    id: p4_kg
+    name: p4_kg
+    internal: true
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: 0
+    max_value: 300
+    step: 0.1
+    mode: box
+  - platform: template
+    id: p4_counts
+    name: p4_counts
+    internal: true
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: -10000000
+    max_value: 10000000
+    step: 1
+    mode: box
+
+  - platform: template
+    id: p5_kg
+    name: p5_kg
+    internal: true
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: 0
+    max_value: 300
+    step: 0.1
+    mode: box
+  - platform: template
+    id: p5_counts
+    name: p5_counts
+    internal: true
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: -10000000
+    max_value: 10000000
+    step: 1
+    mode: box
+
+button:
+  - platform: template
+    id: zero_btn
+    name: zero
+    entity_category: config
+    on_press:
+      - lambda: |-
+          ui::on_zero();
+
+  - platform: template
+    id: calibrate_btn
+    name: calibrate
+    entity_category: config
+    on_press:
+      - lambda: |-
+          ui::on_calib(id(known_kg).state);
+
+  - platform: template
+    id: curve_reset_btn
+    name: curve_reset
+    entity_category: config
+    on_press:
+      - lambda: |-
+          ui::on_curve_reset();
