@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "nvs.h"
 #include "esphome/core/preferences.h"
 #include "esphome/components/wifi/wifi_component.h"
@@ -21,6 +22,9 @@ inline bool logging_started = false;
 // True only after ESP-IDF confirms our fallback AP is actually running.
 // Before that, a peer AP is already established and should be preferred.
 inline std::atomic_bool own_ap_started{false};
+// Время (мс) последнего подключения клиента к нашей точке. Кэш «не сосед» старше этого
+// момента не действует: переподключившееся устройство проверяется заново.
+inline volatile uint32_t ap_join_ms = 0;
 
 // ESPHome's clear_sta() clears only the runtime list. With no static STA
 // networks in YAML, runtime credentials use fallback preference key
@@ -105,6 +109,7 @@ inline void wifi_event_log(void *, esp_event_base_t base, int32_t id, void *data
       auto *ev = static_cast<wifi_event_ap_staconnected_t *>(data);
       char mac[18];
       mac_text(ev->mac, mac);
+      ap_join_ms = (uint32_t) (esp_timer_get_time() / 1000);
       ESP_LOGI(TAG_NR, "AP client connected: mac=%s aid=%u", mac, (unsigned) ev->aid);
     } else if (id == WIFI_EVENT_AP_STADISCONNECTED && data != nullptr) {
       auto *ev = static_cast<wifi_event_ap_stadisconnected_t *>(data);

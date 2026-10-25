@@ -764,7 +764,8 @@ inline bool probe_peer(std::string &peer_role) {
     }
     if (cache_slot >= 0 && peer_candidate_cache[cache_slot].valid &&
         memcmp(peer_candidate_cache[cache_slot].mac, pairs[i].mac, 6) == 0 &&
-        (uint32_t) (now - peer_candidate_cache[cache_slot].checked_at) < kNonPeerRecheckMs)
+        (uint32_t) (now - peer_candidate_cache[cache_slot].checked_at) < kNonPeerRecheckMs &&
+        peer_candidate_cache[cache_slot].checked_at >= netrole::ap_join_ms)
       continue;
     char ip[16];
     snprintf(ip, sizeof(ip), IPSTR, IP2STR(&pairs[i].ip));
