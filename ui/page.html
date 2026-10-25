@@ -204,6 +204,29 @@ h2{margin:24px 8px 10px;font-size:13px;font-weight:600;letter-spacing:.06em;text
   </div>
 </section>
 
+<section class="page" id="p-tests">
+  <p class="hint" style="margin:0 0 14px">Каждый тест пишет начало и конец в журнал устройства. Время в строках — внутреннее время устройства, если оно синхронизировано со страницей, иначе — время с запуска.</p>
+  <div class="glass card">
+    <h3 style="margin:0 0 6px">Маркер в журнал</h3>
+    <p class="hint" style="margin:0 0 12px">Записывает отметку в журнал. Нажмите перед нужным действием, чтобы найти момент в логе.</p>
+    <button class="btn" data-test="marker">Записать маркер</button>
+  </div>
+  <div class="glass card">
+    <h3 style="margin:0 0 6px">Состояние роли</h3>
+    <p class="hint" style="margin:0 0 12px">Пишет роль, своя точка активна или нет, сохранённую сеть и связь с соседом. Без сканирования.</p>
+    <button class="btn" data-test="role">Проверить роль</button>
+  </div>
+  <div class="glass card">
+    <h3 style="margin:0 0 6px">Скан эфира</h3>
+    <p class="hint" style="margin:0 0 12px">Один скан сетей: пишет все найденные точки и результат поиска точки настройки. Связь на несколько секунд прерывается.</p>
+    <button class="btn" data-test="scan">Сканировать</button>
+  </div>
+  <div class="glass card">
+    <h3 style="margin:0 0 6px">Проверка соседа</h3>
+    <p class="hint" style="margin:0 0 12px">Запрос к соседу по адресу точки и по имени. Пишет ответ и время ответа.</p>
+    <button class="btn" data-test="peer">Проверить соседа</button>
+  </div>
+</section>
 <section class="page" id="p-sys">
   <div class="glass list">
     <div class="row"><span class="k">Устройство</span><span class="v" id="s-dev">—</span></div>
@@ -233,6 +256,7 @@ h2{margin:24px 8px 10px;font-size:13px;font-weight:600;letter-spacing:.06em;text
   <button class="tab" role="tab" id="t-net" data-p="net" aria-selected="false"><svg viewBox="0 0 24 24"><use href="#i-wifi"/></svg>Сеть</button>
   <button class="tab" role="tab" id="t-cal" data-p="cal" aria-selected="false" style="display:none"><svg viewBox="0 0 24 24"><use href="#i-cal"/></svg>Калибровка</button>
   <button class="tab" role="tab" id="t-sys" data-p="sys" aria-selected="false"><svg viewBox="0 0 24 24"><use href="#i-sys"/></svg>Система</button>
+  <button class="tab" role="tab" id="t-tests" data-p="tests" aria-selected="false"><svg viewBox="0 0 24 24"><use href="#i-check"/></svg>Тесты</button>
 </nav>
 
 <div class="toast glass" id="toast" role="status" aria-live="polite"></div>
@@ -295,7 +319,7 @@ const post=(u,b,ms)=>api(u,b?{method:'POST',headers:{'Content-Type':'application
 function setBusy(b){busy=b;document.querySelectorAll('.btn,.net').forEach(x=>x.disabled=b)}
 
 /* ---------- разделы ---------- */
-const pages=['home','net','cal','sys'];
+const pages=['home','net','cal','sys','tests'];
 function go(p){
   if(!pages.includes(p)||(p==='cal'&&!isScale))p='home';
   pages.forEach(x=>{$('p-'+x).classList.toggle('on',x===p);$('t-'+x).setAttribute('aria-selected',x===p)});
@@ -367,7 +391,7 @@ function syncClock(j){
   const now=Math.floor(Date.now()/1000);
   if(Math.abs((j.clock_ts||0)-now)<=5||Date.now()-lastClockTry<10000)return;
   lastClockTry=Date.now();
-  post('/time',{ts:now}).catch(()=>{});
+  post('/time',{ts:now,tz:new Date().getTimezoneOffset()}).catch(()=>{});
 }
 
 /* ---------- панели ---------- */
@@ -470,6 +494,12 @@ async function rebootIt(){
   catch(e){say('Устройство перезагружается…',true)}
   setBusy(false);closeSheet();
 }
+async function runTest(n){
+  if(busy)return;
+  try{const j=await post('/test',{name:n});say(j.msg||'Тест принят',true)}
+  catch(e){say('Нет связи с устройством')}
+  setTimeout(refresh,1500);
+}
 async function curveReset(){
   if(busy)return;
   if(!await ask('Сбросить точки?','Все точки калибровки будут удалены.','Сбросить',true))return;
@@ -477,6 +507,7 @@ async function curveReset(){
   setTimeout(refresh,1500);
 }
 $('b-open').onclick=openWin;$('b-reset').onclick=resetNet;$('b-scan').onclick=scan;$('b-reboot').onclick=rebootIt;
+document.querySelectorAll('[data-test]').forEach(b=>b.onclick=()=>runTest(b.dataset.test));
 $('b-zero').onclick=zeroIt;$('b-calib').onclick=calibIt;$('b-curve').onclick=curveReset;
 
 go(location.hash.slice(1));renderEv();refresh();

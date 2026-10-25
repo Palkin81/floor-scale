@@ -47,6 +47,12 @@ globals:
     type: int
     initial_value: "0"
 
+interval:
+  - interval: 200ms
+    then:
+      - lambda: |-
+          ui::run_pending();   // команды и тесты с веб-страницы
+
 script:
   - id: pick_role
     then:
