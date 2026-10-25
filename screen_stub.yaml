@@ -42,6 +42,9 @@ globals:
   - id: role_selected
     type: bool
     initial_value: "false"
+  - id: role_idle_scans
+    type: int
+    initial_value: "0"
 
 script:
   - id: pick_role
@@ -65,7 +68,19 @@ script:
                     ESP_LOGI("role", "Saved STA is setup network; checking peer AP instead of assuming connected");
                   }
                   if (!netrole::find_bssid("${prov_ssid}", found)) {
-                    ESP_LOGI("role", "No peer setup AP found; will scan again");
+                    if (netrole::own_ap_active()) {
+                      // Своя точка работает, соседа нет: одна повторная проверка
+                      // через 45 с (tie-break при одновременном старте), потом стоп.
+                      if (id(role_idle_scans) >= 1) {
+                        ESP_LOGI("role", "No peer after recheck; staying AP, scanning stopped");
+                        id(role_selected) = true;
+                      } else {
+                        id(role_idle_scans) = 1;
+                        ESP_LOGI("role", "Own AP up, no peer found; one recheck in 45 s");
+                      }
+                    } else {
+                      ESP_LOGI("role", "No peer setup AP found; will scan again");
+                    }
                   } else if (netrole::should_join_as_client(found)) {
                     if (saved_setup_sta) {
                       ESP_LOGI("role", "Peer setup AP selected; existing STA config will connect");
@@ -85,7 +100,7 @@ script:
                     id(role_selected) = true;
                   }
                 }
-            - delay: 10s
+            - delay: !lambda 'return id(role_selected) ? 0 : (id(role_idle_scans) > 0 ? 45000 : 10000);'
 
 esp32:
   board: esp32dev
