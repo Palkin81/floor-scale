@@ -327,6 +327,11 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <button class="btn" data-test="scan">Сканировать</button>
 </div>
 <div class="glass card">
+<h3 style="margin:0 0 6px">Тай-брейк: сброс обоих</h3>
+<p class="hint" style="margin:0 0 12px">Сбрасывает сеть на обоих устройствах: они перезагружаются почти одновременно. Через ~70 с после загрузки каждое пишет итог роли в журнал. Лог обоих устройств нужен для разбора.</p>
+<button class="btn dng" data-test="tiebreak">Запустить тай-брейк</button>
+</div>
+<div class="glass card">
 <h3 style="margin:0 0 6px">Проверка соседа</h3>
 <p class="hint" style="margin:0 0 12px">Запрос к соседу по адресу точки и по имени. Пишет ответ и время ответа.</p>
 <button class="btn" data-test="peer">Проверить соседа</button>
@@ -718,6 +723,10 @@ inline bool resolve_peer_host(std::string &ip) {
   return true;
 }
 
+// Клиент точки, который не оказался соседом (например, телефон), не опрашиваем чаще
+// раза в 10 минут. Раньше опрос был каждые 15 с и давал select() timeout в логе.
+inline constexpr uint32_t kNonPeerRecheckMs = 600000;
+
 inline bool probe_peer(std::string &peer_role) {
   const std::string expected = device_kind == "scale" ? "screen" : "scale";
   const std::string role = local_role();
@@ -747,7 +756,7 @@ inline bool probe_peer(std::string &peer_role) {
       if (peer_candidate_cache[j].valid &&
           memcmp(peer_candidate_cache[j].mac, pairs[i].mac, 6) == 0) {
         cache_slot = j;
-        if ((uint32_t) (now - peer_candidate_cache[j].checked_at) < 15000) break;
+        if ((uint32_t) (now - peer_candidate_cache[j].checked_at) < kNonPeerRecheckMs) break;
         cache_slot = j;
         break;
       }
@@ -755,7 +764,7 @@ inline bool probe_peer(std::string &peer_role) {
     }
     if (cache_slot >= 0 && peer_candidate_cache[cache_slot].valid &&
         memcmp(peer_candidate_cache[cache_slot].mac, pairs[i].mac, 6) == 0 &&
-        (uint32_t) (now - peer_candidate_cache[cache_slot].checked_at) < 15000)
+        (uint32_t) (now - peer_candidate_cache[cache_slot].checked_at) < kNonPeerRecheckMs)
       continue;
     char ip[16];
     snprintf(ip, sizeof(ip), IPSTR, IP2STR(&pairs[i].ip));
@@ -1041,18 +1050,39 @@ static esp_err_t h_open(httpd_req_t *req) {
   return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
-static esp_err_t h_reset(httpd_req_t *req) {
-  bool peer_reset = false;
-  if (prov::is_home_network(setup_ssid.c_str())) {
-    peer_reset = prov_link::reset_peer_at(peer_host);
-  } else {
-    std::string sta_ssid;
-    const bool setup_client = netrole::saved_sta(sta_ssid) && setup_ssid.size() > 0 &&
-        sta_ssid == setup_ssid;
-    peer_reset = setup_client
-        ? prov_link::reset_peer_at(peer_ap_ip)
-        : prov_link::reset_ap_clients();
+// Сброс соседа: адрес зависит от сети (домашняя / setup-клиент / мастер с клиентами)
+inline bool reset_peer_now() {
+  if (prov::is_home_network(setup_ssid.c_str())) return prov_link::reset_peer_at(peer_host);
+  std::string sta_ssid;
+  const bool setup_client = netrole::saved_sta(sta_ssid) && setup_ssid.size() > 0 &&
+      sta_ssid == setup_ssid;
+  return setup_client ? prov_link::reset_peer_at(peer_ap_ip) : prov_link::reset_ap_clients();
+}
+
+// Метка «после сброса»: переживает перезагрузку (NVS), чтобы после загрузки записать итог роли
+inline void mark_reset_pending() {
+  nvs_handle_t h = 0;
+  if (nvs_open("ui_test", NVS_READWRITE, &h) != ESP_OK) return;
+  nvs_set_u8(h, "tb_pending", 1);
+  nvs_commit(h);
+  nvs_close(h);
+}
+inline bool take_reset_pending() {
+  nvs_handle_t h = 0;
+  if (nvs_open("ui_test", NVS_READWRITE, &h) != ESP_OK) return false;
+  uint8_t v = 0;
+  const bool had = nvs_get_u8(h, "tb_pending", &v) == ESP_OK && v == 1;
+  if (had) {
+    nvs_erase_key(h, "tb_pending");
+    nvs_commit(h);
   }
+  nvs_close(h);
+  return had;
+}
+
+static esp_err_t h_reset(httpd_req_t *req) {
+  const bool peer_reset = reset_peer_now();
+  mark_reset_pending();
 
   const char *msg = peer_reset
       ? "Сброс отправлен обоим устройствам, они перезагружаются"
@@ -1078,6 +1108,7 @@ static const char *test_label(const std::string &n) {
   if (n == "test_role") return "состояние роли";
   if (n == "test_scan") return "скан эфира";
   if (n == "test_peer") return "проверка соседа";
+  if (n == "test_tiebreak") return "тай-брейк: сброс обоих";
   return nullptr;
 }
 
@@ -1116,10 +1147,30 @@ static void test_task(void *arg) {
                (unsigned long) (now_ms() - t0));
     }
     set_status("Проверка соседа записана в журнал");
+  } else if (self == "test_tiebreak") {
+    ESP_LOGI(TAG_UI, "[%s] сброс обоих: команда соседу и перезагрузка этого устройства", clock_stamp().c_str());
+    const bool peer_ok = reset_peer_now();
+    ESP_LOGI(TAG_UI, "[%s] сосед %s", clock_stamp().c_str(),
+             peer_ok ? "принял сброс" : "не ответил: сбрасывается только это устройство");
+    mark_reset_pending();
+    set_status("Сброс: перезагрузка для теста тай-брейка");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    if (on_reset) on_reset();  // перезагрузка; итог роли запишется после загрузки
   }
   ESP_LOGI(TAG_UI, "[%s] ТЕСТ ЗАВЕРШЁН: %s", clock_stamp().c_str(), label ? label : self.c_str());
   free(name);
   test_busy = false;
+  vTaskDelete(nullptr);
+}
+
+// После загрузки, если перед ней был сброс: через 70 с (роль и 45-секундная проверка) пишем итог
+inline void tiebreak_check_task(void *) {
+  vTaskDelay(pdMS_TO_TICKS(70000));
+  std::string saved;
+  const bool has_saved = netrole::saved_sta(saved);
+  ESP_LOGI(TAG_UI, "[%s] ТЕСТ ТАЙ-БРЕЙК, итог после сброса: роль=%s; своя точка активна=%s; сохранённая сеть=%s; связь с соседом=%s",
+           clock_stamp().c_str(), local_role().c_str(), netrole::own_ap_active() ? "да" : "нет",
+           has_saved ? saved.c_str() : "нет", peer_link_state ? "да" : "нет");
   vTaskDelete(nullptr);
 }
 
@@ -1177,6 +1228,7 @@ static esp_err_t h_time(httpd_req_t *req) {
 
 // Команда от соседа. Отвечает до сброса и не пересылает команду обратно.
 static esp_err_t h_peer_reset(httpd_req_t *req) {
+  mark_reset_pending();
   set_status("Сосед запросил сброс сети");
   httpd_resp_set_type(req, "application/json; charset=utf-8");
   httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"Сброс принят\"}");
@@ -1297,6 +1349,9 @@ inline void start(int port) {
   u.uri = "/test"; u.method = HTTP_POST; u.handler = h_test;
   reg_uri(srv, u);
 
+  if (take_reset_pending()) {
+    xTaskCreate(tiebreak_check_task, "tb_check", 8192, nullptr, 1, nullptr);
+  }
   ESP_LOGI(TAG_UI, "UI started on port %d", port);
 }
 
