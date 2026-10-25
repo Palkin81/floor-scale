@@ -9,6 +9,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/time.h>
+#include <time.h>
 #include "esp_http_server.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
@@ -38,6 +40,10 @@ inline std::string peer_ap_ip;
 inline std::string peer_host;
 inline std::function<void(const std::string &, const std::string &)> on_creds;
 inline std::function<void()> on_reset;
+// Перезагрузка по кнопке на странице. Задаётся из YAML: App.reboot()
+inline std::function<void()> on_reboot;
+// Время: нет часов с батареей и сети, поэтому страница передаёт его (Unix-секунды, UTC)
+inline volatile long long clock_set_at = 0;  // 0 = время не задано
 inline esphome::wifi::WiFiComponent *wifi_comp_ptr = nullptr;  // задаётся из YAML: id(wifi_comp)
 inline SemaphoreHandle_t peer_status_lock = nullptr;
 inline bool peer_check_done = false;
@@ -287,11 +293,17 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <div class="row"><span class="k">Режим пары</span><span class="v" id="s-role">—</span></div>
 <div class="row"><span class="k">Второе устройство</span><span class="v" id="s-peer">—</span></div>
 <div class="row"><span class="k">Окно настройки</span><span class="v" id="s-win">—</span></div>
+<div class="row"><span class="k">Время устройства</span><span class="v" id="s-clock">—</span></div>
 </div>
 <h2>Сброс сети</h2>
 <div class="glass card">
 <p class="hint" style="margin:0 0 14px">Сбрасывает Wi-Fi на обоих устройствах, если второе отвечает. Оба перезагрузятся и заново найдут друг друга.</p>
 <button class="btn dng" id="b-reset">Сбросить сеть</button>
+</div>
+<h2>Перезагрузка</h2>
+<div class="glass card">
+<p class="hint" style="margin:0 0 14px">Перезагружает только это устройство. Сосед не затрагивается, сеть сохраняется.</p>
+<button class="btn" id="b-reboot">Перезагрузить</button>
 </div>
 <h2>События</h2>
 <div class="glass list" id="events"></div>
@@ -413,13 +425,23 @@ $('h-st').textContent=j.status||'—';
 $('n-win').textContent=j.window?'Окно открыто: устройство принимает настройки сети от соседа.':'Окно закрыто. Пока оно закрыто, устройство не принимает новые настройки сети от соседа.';
 $('s-dev').textContent=title;$('s-role').textContent=j.role||'не определён';
 $('s-peer').textContent=peer;$('s-win').textContent=j.window?'Открыто':'Закрыто';
+$('s-clock').textContent=j.clock_ts?new Date(j.clock_ts*1000).toLocaleString('ru-RU'):'не задано';
 if(isScale)renderCurve(j.curve);
 if(j.status&&j.status!==lastSt){lastSt=j.status;if(j.status!=='Ожидание')logEv(j.status)}
 }
 async function refresh(){
 if(document.hidden)return;
-try{S=await api('/status');offline=0;render(S)}
+try{S=await api('/status');offline=0;render(S);syncClock(S)}
 catch(e){if(++offline>=2){chip('bad','Нет связи со страницей')}}
+}
+/* ---------- время ---------- */
+let lastClockTry=0;
+// У устройства нет часов с батареей и сети: время берём у телефона/ПК, на котором открыта страница
+function syncClock(j){
+const now=Math.floor(Date.now()/1000);
+if(Math.abs((j.clock_ts||0)-now)<=5||Date.now()-lastClockTry<10000)return;
+lastClockTry=Date.now();
+post('/time',{ts:now}).catch(()=>{});
 }
 /* ---------- панели ---------- */
 function show(id){
@@ -512,13 +534,21 @@ if(!v){say('Укажите известный вес');$('known').focus();return
 try{const j=await post('/calib',{known:v});say(j.msg)}catch(e){say('Нет связи с устройством')}
 setTimeout(refresh,1500);
 }
+async function rebootIt(){
+if(busy)return;
+if(!await ask('Перезагрузить?','Это устройство перезагрузится. Сосед не затрагивается.','Перезагрузить',true))return;
+setBusy(true);prog('Перезагрузка','Устройство перезагружается…');
+try{const j=await post('/reboot',null,5000);say(j.msg||'Перезагрузка',true)}
+catch(e){say('Устройство перезагружается…',true)}
+setBusy(false);closeSheet();
+}
 async function curveReset(){
 if(busy)return;
 if(!await ask('Сбросить точки?','Все точки калибровки будут удалены.','Сбросить',true))return;
 try{const j=await post('/curve_reset');say(j.msg)}catch(e){say('Нет связи с устройством')}
 setTimeout(refresh,1500);
 }
-$('b-open').onclick=openWin;$('b-reset').onclick=resetNet;$('b-scan').onclick=scan;
+$('b-open').onclick=openWin;$('b-reset').onclick=resetNet;$('b-scan').onclick=scan;$('b-reboot').onclick=rebootIt;
 $('b-zero').onclick=zeroIt;$('b-calib').onclick=calibIt;$('b-curve').onclick=curveReset;
 go(location.hash.slice(1));renderEv();refresh();
 setInterval(refresh,5000);
@@ -740,6 +770,9 @@ inline std::string status_json() {
   out += "\"ip\":\"" + ip + "\",";
   out += "\"signal\":\"" + signal + "\",";
   out += std::string("\"window\":") + (window_open() ? "true" : "false");
+  // Текущее время устройства (Unix, UTC) или 0, если время ещё не задано страницей
+  const long long clock_now = clock_set_at ? (long long) time(nullptr) : 0;
+  out += ",\"clock_ts\":" + std::to_string(clock_now);
   out += ",\"kind\":\"" + device_kind + "\"";
   out += ",\"title\":\"" + json_escape(device_title.c_str()) + "\"";
   bool checked = false, applicable = false, linked = false;
@@ -982,6 +1015,33 @@ static esp_err_t h_reset(httpd_req_t *req) {
   return ESP_OK;
 }
 
+// Перезагрузка по кнопке. Ответ уходит до перезагрузки; запись в журнал устройства.
+static esp_err_t h_reboot(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  if (!on_reboot) return reply_msg(req, "Перезагрузка не поддерживается");
+  ESP_LOGW(TAG_UI, "reboot requested from web page");
+  set_status("Перезагрузка по команде со страницы");
+  httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"Перезагрузка\"}");
+  vTaskDelay(pdMS_TO_TICKS(250));
+  on_reboot();
+  return ESP_OK;
+}
+
+// Установка времени со страницы (поле ts: Unix-секунды, UTC). Принимаем только разумные значения.
+static esp_err_t h_time(httpd_req_t *req) {
+  std::string b;
+  if (recv_body(req, b, 100) < 0) return reply_msg(req, "Ошибка запроса");
+  const long long ts = strtoll(form_value(b, "ts").c_str(), nullptr, 10);
+  if (ts < 1704067200LL || ts > 4102444800LL) return reply_msg(req, "Неверное время");
+  struct timeval tv = {};
+  tv.tv_sec = (time_t) ts;
+  tv.tv_usec = 0;
+  if (settimeofday(&tv, nullptr) != 0) return reply_msg(req, "Не удалось установить время");
+  clock_set_at = ts;
+  ESP_LOGI(TAG_UI, "clock set from web page: unix=%lld", ts);
+  return reply_msg(req, "Время установлено");
+}
+
 // Команда от соседа. Отвечает до сброса и не пересылает команду обратно.
 static esp_err_t h_peer_reset(httpd_req_t *req) {
   set_status("Сосед запросил сброс сети");
@@ -1093,6 +1153,12 @@ inline void start(int port) {
 
   u = {};
   u.uri = "/curve_reset"; u.method = HTTP_POST; u.handler = h_curve_reset;
+  reg_uri(srv, u);
+  u = {};
+  u.uri = "/reboot"; u.method = HTTP_POST; u.handler = h_reboot;
+  reg_uri(srv, u);
+  u = {};
+  u.uri = "/time"; u.method = HTTP_POST; u.handler = h_time;
   reg_uri(srv, u);
 
   ESP_LOGI(TAG_UI, "UI started on port %d", port);

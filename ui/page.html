@@ -210,11 +210,17 @@ h2{margin:24px 8px 10px;font-size:13px;font-weight:600;letter-spacing:.06em;text
     <div class="row"><span class="k">Режим пары</span><span class="v" id="s-role">—</span></div>
     <div class="row"><span class="k">Второе устройство</span><span class="v" id="s-peer">—</span></div>
     <div class="row"><span class="k">Окно настройки</span><span class="v" id="s-win">—</span></div>
+    <div class="row"><span class="k">Время устройства</span><span class="v" id="s-clock">—</span></div>
   </div>
   <h2>Сброс сети</h2>
   <div class="glass card">
     <p class="hint" style="margin:0 0 14px">Сбрасывает Wi-Fi на обоих устройствах, если второе отвечает. Оба перезагрузятся и заново найдут друг друга.</p>
     <button class="btn dng" id="b-reset">Сбросить сеть</button>
+  </div>
+  <h2>Перезагрузка</h2>
+  <div class="glass card">
+    <p class="hint" style="margin:0 0 14px">Перезагружает только это устройство. Сосед не затрагивается, сеть сохраняется.</p>
+    <button class="btn" id="b-reboot">Перезагрузить</button>
   </div>
   <h2>События</h2>
   <div class="glass list" id="events"></div>
@@ -344,13 +350,24 @@ function render(j){
   $('n-win').textContent=j.window?'Окно открыто: устройство принимает настройки сети от соседа.':'Окно закрыто. Пока оно закрыто, устройство не принимает новые настройки сети от соседа.';
   $('s-dev').textContent=title;$('s-role').textContent=j.role||'не определён';
   $('s-peer').textContent=peer;$('s-win').textContent=j.window?'Открыто':'Закрыто';
+  $('s-clock').textContent=j.clock_ts?new Date(j.clock_ts*1000).toLocaleString('ru-RU'):'не задано';
   if(isScale)renderCurve(j.curve);
   if(j.status&&j.status!==lastSt){lastSt=j.status;if(j.status!=='Ожидание')logEv(j.status)}
 }
 async function refresh(){
   if(document.hidden)return;
-  try{S=await api('/status');offline=0;render(S)}
+  try{S=await api('/status');offline=0;render(S);syncClock(S)}
   catch(e){if(++offline>=2){chip('bad','Нет связи со страницей')}}
+}
+
+/* ---------- время ---------- */
+let lastClockTry=0;
+// У устройства нет часов с батареей и сети: время берём у телефона/ПК, на котором открыта страница
+function syncClock(j){
+  const now=Math.floor(Date.now()/1000);
+  if(Math.abs((j.clock_ts||0)-now)<=5||Date.now()-lastClockTry<10000)return;
+  lastClockTry=Date.now();
+  post('/time',{ts:now}).catch(()=>{});
 }
 
 /* ---------- панели ---------- */
@@ -445,13 +462,21 @@ async function calibIt(){
   try{const j=await post('/calib',{known:v});say(j.msg)}catch(e){say('Нет связи с устройством')}
   setTimeout(refresh,1500);
 }
+async function rebootIt(){
+  if(busy)return;
+  if(!await ask('Перезагрузить?','Это устройство перезагрузится. Сосед не затрагивается.','Перезагрузить',true))return;
+  setBusy(true);prog('Перезагрузка','Устройство перезагружается…');
+  try{const j=await post('/reboot',null,5000);say(j.msg||'Перезагрузка',true)}
+  catch(e){say('Устройство перезагружается…',true)}
+  setBusy(false);closeSheet();
+}
 async function curveReset(){
   if(busy)return;
   if(!await ask('Сбросить точки?','Все точки калибровки будут удалены.','Сбросить',true))return;
   try{const j=await post('/curve_reset');say(j.msg)}catch(e){say('Нет связи с устройством')}
   setTimeout(refresh,1500);
 }
-$('b-open').onclick=openWin;$('b-reset').onclick=resetNet;$('b-scan').onclick=scan;
+$('b-open').onclick=openWin;$('b-reset').onclick=resetNet;$('b-scan').onclick=scan;$('b-reboot').onclick=rebootIt;
 $('b-zero').onclick=zeroIt;$('b-calib').onclick=calibIt;$('b-curve').onclick=curveReset;
 
 go(location.hash.slice(1));renderEv();refresh();

@@ -28,6 +28,7 @@ esphome:
             ESP_LOGI("reset", "persistent Wi-Fi credentials cleared=%s", cleared ? "yes" : "no");
             App.reboot();
           };
+          ui::on_reboot = []() { App.reboot(); };
           ui::on_creds = [](const std::string &ssid, const std::string &pass) {
             id(wifi_comp)->save_wifi_sta(ssid, pass);
             delay(1000);
