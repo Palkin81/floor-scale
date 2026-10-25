@@ -1067,17 +1067,22 @@ inline void mark_reset_pending() {
   nvs_commit(h);
   nvs_close(h);
 }
-inline bool take_reset_pending() {
+// Метка читается при каждой загрузке и снимается только после записи итога:
+// если устройство перезагрузилось ещё раз (тай-брейк), итог будет после последней загрузки.
+inline bool reset_pending() {
   nvs_handle_t h = 0;
   if (nvs_open("ui_test", NVS_READWRITE, &h) != ESP_OK) return false;
   uint8_t v = 0;
   const bool had = nvs_get_u8(h, "tb_pending", &v) == ESP_OK && v == 1;
-  if (had) {
-    nvs_erase_key(h, "tb_pending");
-    nvs_commit(h);
-  }
   nvs_close(h);
   return had;
+}
+inline void clear_reset_pending() {
+  nvs_handle_t h = 0;
+  if (nvs_open("ui_test", NVS_READWRITE, &h) != ESP_OK) return;
+  nvs_erase_key(h, "tb_pending");
+  nvs_commit(h);
+  nvs_close(h);
 }
 
 static esp_err_t h_reset(httpd_req_t *req) {
@@ -1171,6 +1176,7 @@ inline void tiebreak_check_task(void *) {
   ESP_LOGI(TAG_UI, "[%s] ТЕСТ ТАЙ-БРЕЙК, итог после сброса: роль=%s; своя точка активна=%s; сохранённая сеть=%s; связь с соседом=%s",
            clock_stamp().c_str(), local_role().c_str(), netrole::own_ap_active() ? "да" : "нет",
            has_saved ? saved.c_str() : "нет", peer_link_state ? "да" : "нет");
+  clear_reset_pending();
   vTaskDelete(nullptr);
 }
 
@@ -1349,7 +1355,7 @@ inline void start(int port) {
   u.uri = "/test"; u.method = HTTP_POST; u.handler = h_test;
   reg_uri(srv, u);
 
-  if (take_reset_pending()) {
+  if (reset_pending()) {
     xTaskCreate(tiebreak_check_task, "tb_check", 8192, nullptr, 1, nullptr);
   }
   ESP_LOGI(TAG_UI, "UI started on port %d", port);
