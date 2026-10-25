@@ -27,6 +27,7 @@ esphome:
     - lib/prov_link.h
     - lib/wifi_probe.h
     - lib/net_role.h
+    - lib/ui_icons.h
     - lib/ui_server.h
   on_boot:
     priority: -100

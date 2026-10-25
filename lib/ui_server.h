@@ -26,6 +26,8 @@
 #include "prov_link.h"
 #include "net_role.h"
 
+#include "ui_icons.h"
+
 namespace ui {
 
 static const char *TAG_UI = "ui";
@@ -118,8 +120,16 @@ static const char PAGE[] = R"HTML(
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
-<link rel="icon" href="data:,">
-<title>Floor Scale</title>
+<link rel="icon" href="/icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="{{TITLE}}">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" content="#f2f4f8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0b0d12" media="(prefers-color-scheme: dark)">
+<title>{{TITLE}}</title>
 <style>
 :root{
 --text:#16181d;--text2:rgba(22,24,29,.66);--text3:rgba(22,24,29,.4);
@@ -345,6 +355,13 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <div class="row"><span class="k">Окно настройки</span><span class="v" id="s-win">—</span></div>
 <div class="row"><span class="k">Время устройства</span><span class="v" id="s-clock">—</span></div>
 </div>
+<div id="install">
+<h2>На экран телефона</h2>
+<div class="glass card">
+<p class="hint" style="margin:0 0 10px" id="inst-text"></p>
+<p class="hint" style="margin:0">Адрес этого устройства в сети настройки и в домашней сети разный, поэтому ярлык нужно добавить отдельно в каждой, когда вы туда попадёте.</p>
+</div>
+</div>
 <h2>Сброс сети</h2>
 <div class="glass card">
 <p class="hint" style="margin:0 0 14px">Сбрасывает Wi-Fi на обоих устройствах, если второе отвечает. Оба перезагрузятся и заново найдут друг друга.</p>
@@ -394,6 +411,16 @@ const $=id=>document.getElementById(id);
 const el=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e};
 const clear=e=>{e.textContent=''};
 const num=v=>v==null?'—':String(v).replace('.',',');
+(function(){
+const standalone=window.navigator.standalone===true||(window.matchMedia&&matchMedia('(display-mode: standalone)').matches);
+const ua=navigator.userAgent||'';
+const ios=/iPhone|iPad|iPod/.test(ua)||(/Macintosh/.test(ua)&&navigator.maxTouchPoints>1);
+const box=document.getElementById('install');
+if(standalone){box.hidden=true;return;}
+document.getElementById('inst-text').textContent=ios
+?'Откройте страницу в Safari, нажмите «Поделиться» и выберите «На экран Домой». Ярлык откроется без адресной строки, со своей иконкой.'
+:'В Chrome откройте меню ⋮ и выберите «Добавить на главный экран» (или «Установить приложение»). Ярлык получит свою иконку; адресная строка может остаться, потому что устройство отдаёт страницу по HTTP, без HTTPS.';
+})();
 let S={},offline=0,isScale=false,busy=false,pend='',askRes=null,cur=null,tt,ready=false,lastSt='';
 const events=[];
 /* ---------- сообщения ---------- */
@@ -857,9 +884,50 @@ inline std::string status_json() {
   return out;
 }
 
+// Страница отдаётся кусками: маркер {{TITLE}} заменяется именем устройства,
+// чтобы ярлык на экране телефона назывался «Весы» или «Экран».
 static esp_err_t h_root(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html; charset=utf-8");
-  return httpd_resp_send(req, PAGE, HTTPD_RESP_USE_STRLEN);
+  static const char MARK[] = "{{TITLE}}";
+  const char *p = PAGE;
+  const char *hit;
+  while ((hit = strstr(p, MARK)) != nullptr) {
+    if (hit > p) httpd_resp_send_chunk(req, p, hit - p);  // нулевая длина закрыла бы ответ
+    httpd_resp_send_chunk(req, device_title.c_str(), HTTPD_RESP_USE_STRLEN);
+    p = hit + sizeof(MARK) - 1;
+  }
+  httpd_resp_send_chunk(req, p, HTTPD_RESP_USE_STRLEN);
+  return httpd_resp_send_chunk(req, nullptr, 0);
+}
+
+static esp_err_t h_manifest(httpd_req_t *req) {
+  const std::string t = json_escape(device_title.c_str());
+  const std::string theme = device_kind == "scale" ? "#2846c8" : "#107870";
+  std::string m = "{\"name\":\"Floor Scale · " + t + "\",\"short_name\":\"" + t +
+      "\",\"start_url\":\"/\",\"scope\":\"/\",\"display\":\"standalone\"," +
+      "\"background_color\":\"" + theme + "\",\"theme_color\":\"" + theme + "\"," +
+      "\"icons\":[{\"src\":\"/icon-192.png\",\"sizes\":\"192x192\",\"type\":\"image/png\",\"purpose\":\"any maskable\"}," +
+      "{\"src\":\"/icon-512.png\",\"sizes\":\"512x512\",\"type\":\"image/png\",\"purpose\":\"any maskable\"}]}";
+  httpd_resp_set_type(req, "application/manifest+json");
+  httpd_resp_set_hdr(req, "Cache-Control", "max-age=3600");
+  return httpd_resp_send(req, m.c_str(), m.size());
+}
+
+static esp_err_t send_icon(httpd_req_t *req, const uint8_t *scale, size_t scale_len,
+                           const uint8_t *screen, size_t screen_len) {
+  const bool is_scale = device_kind == "scale";
+  httpd_resp_set_type(req, "image/png");
+  httpd_resp_set_hdr(req, "Cache-Control", "max-age=86400");
+  return httpd_resp_send(req, (const char *) (is_scale ? scale : screen), is_scale ? scale_len : screen_len);
+}
+static esp_err_t h_icon180(httpd_req_t *req) {
+  return send_icon(req, ICON_SCALE_180, ICON_SCALE_180_LEN, ICON_SCREEN_180, ICON_SCREEN_180_LEN);
+}
+static esp_err_t h_icon192(httpd_req_t *req) {
+  return send_icon(req, ICON_SCALE_192, ICON_SCALE_192_LEN, ICON_SCREEN_192, ICON_SCREEN_192_LEN);
+}
+static esp_err_t h_icon512(httpd_req_t *req) {
+  return send_icon(req, ICON_SCALE_512, ICON_SCALE_512_LEN, ICON_SCREEN_512, ICON_SCREEN_512_LEN);
 }
 
 static esp_err_t h_status(httpd_req_t *req) {
@@ -1281,7 +1349,7 @@ inline void start(int port) {
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port = port;
   // По умолчанию 8 обработчиков; у нас 12 маршрутов, лишние тихо отбрасывались (404)
-  cfg.max_uri_handlers = 16;
+  cfg.max_uri_handlers = 24;
   // web_server ESPHome больше не используется, но порт управления оставляем отдельным
   cfg.ctrl_port = 32769;
   // Стек по умолчанию (4 КБ) переполняется в обработчике сканирования
@@ -1354,6 +1422,19 @@ inline void start(int port) {
   reg_uri(srv, u);
   u = {};
   u.uri = "/test"; u.method = HTTP_POST; u.handler = h_test;
+  reg_uri(srv, u);
+
+  u = {};
+  u.uri = "/manifest.webmanifest"; u.method = HTTP_GET; u.handler = h_manifest;
+  reg_uri(srv, u);
+  u = {};
+  u.uri = "/icon-180.png"; u.method = HTTP_GET; u.handler = h_icon180;
+  reg_uri(srv, u);
+  u = {};
+  u.uri = "/icon-192.png"; u.method = HTTP_GET; u.handler = h_icon192;
+  reg_uri(srv, u);
+  u = {};
+  u.uri = "/icon-512.png"; u.method = HTTP_GET; u.handler = h_icon512;
   reg_uri(srv, u);
 
   if (reset_pending()) {
