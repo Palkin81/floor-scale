@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "nvs.h"
 #include "esphome/core/preferences.h"
 #include "esphome/components/wifi/wifi_component.h"
@@ -21,6 +22,9 @@ inline bool logging_started = false;
 // True only after ESP-IDF confirms our fallback AP is actually running.
 // Before that, a peer AP is already established and should be preferred.
 inline std::atomic_bool own_ap_started{false};
+// Время (мс) последнего подключения клиента к нашей точке. Кэш «не сосед» старше этого
+// момента не действует: переподключившееся устройство проверяется заново.
+inline volatile uint32_t ap_join_ms = 0;
 
 // ESPHome's clear_sta() clears only the runtime list. With no static STA
 // networks in YAML, runtime credentials use fallback preference key
@@ -105,6 +109,7 @@ inline void wifi_event_log(void *, esp_event_base_t base, int32_t id, void *data
       auto *ev = static_cast<wifi_event_ap_staconnected_t *>(data);
       char mac[18];
       mac_text(ev->mac, mac);
+      ap_join_ms = (uint32_t) (esp_timer_get_time() / 1000);
       ESP_LOGI(TAG_NR, "AP client connected: mac=%s aid=%u", mac, (unsigned) ev->aid);
     } else if (id == WIFI_EVENT_AP_STADISCONNECTED && data != nullptr) {
       auto *ev = static_cast<wifi_event_ap_stadisconnected_t *>(data);
@@ -205,11 +210,21 @@ inline bool find_bssid(const std::string &target, uint8_t out[6]) {
   return false;
 }
 
+// Своя точка доступа реально работает: режим драйвера включает AP. Флаг
+// own_ap_started ставится по событию AP_START, которое может прийти раньше,
+// чем зарегистрирован обработчик логов (тогда флаг останется ложным и устройство
+// ошибочно присоединится к соседней AP). Поэтому проверяем сам драйвер.
+inline bool own_ap_active() {
+  wifi_mode_t mode = WIFI_MODE_NULL;
+  if (esp_wifi_get_mode(&mode) != ESP_OK) return own_ap_started.load();
+  return mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA;
+}
+
 // If our fallback AP has not started yet, the discovered peer is already
 // established: join it regardless of MAC. Use MAC only to break the tie when
 // both devices independently started their fallback APs before seeing each other.
 inline bool should_join_as_client(const uint8_t found[6]) {
-  if (!own_ap_started.load()) {
+  if (!own_ap_active()) {
     char peer_s[18];
     mac_text(found, peer_s);
     ESP_LOGI(TAG_NR, "peer AP %s already active; own AP not started -> STA client",

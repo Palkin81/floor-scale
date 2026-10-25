@@ -9,6 +9,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/time.h>
+#include <time.h>
 #include "esp_http_server.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
@@ -38,6 +40,26 @@ inline std::string peer_ap_ip;
 inline std::string peer_host;
 inline std::function<void(const std::string &, const std::string &)> on_creds;
 inline std::function<void()> on_reset;
+// Перезагрузка по кнопке на странице. Задаётся из YAML: App.reboot()
+inline std::function<void()> on_reboot;
+// Время: нет часов с батареей и сети, поэтому страница передаёт его (Unix-секунды, UTC)
+inline volatile long long clock_set_at = 0;  // 0 = время не задано
+// Смещение часового пояса страницы в минутах (как getTimezoneOffset: UTC минус местное)
+inline volatile int clock_tz_min = 0;
+
+// Метка времени для журнала: внутренние часы, если их задала страница, иначе время с запуска
+inline std::string clock_stamp() {
+  char b[32];
+  if (clock_set_at) {
+    const time_t local = (time_t) time(nullptr) - (time_t) clock_tz_min * 60;
+    struct tm tm = {};
+    gmtime_r(&local, &tm);
+    snprintf(b, sizeof(b), "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+  } else {
+    snprintf(b, sizeof(b), "с запуска %lu с", (unsigned long) (esp_timer_get_time() / 1000000));
+  }
+  return b;
+}
 inline esphome::wifi::WiFiComponent *wifi_comp_ptr = nullptr;  // задаётся из YAML: id(wifi_comp)
 inline SemaphoreHandle_t peer_status_lock = nullptr;
 inline bool peer_check_done = false;
@@ -75,9 +97,15 @@ inline volatile bool cmd_pending = false;
 inline std::string cmd_name;
 inline float cmd_known = 0.0f;
 
+inline void run_test(const std::string &name);  // определена ниже, рядом с тестами страницы
+
 inline void run_pending() {
   if (!cmd_pending) return;
   cmd_pending = false;
+  if (cmd_name.rfind("test_", 0) == 0) {
+    run_test(cmd_name);
+    return;
+  }
   std::string r;
   if (cmd_name == "zero" && on_zero) r = on_zero();
   else if (cmd_name == "calib" && on_calib) r = on_calib(cmd_known);
@@ -281,17 +309,51 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <button class="btn dng" id="b-curve">Сбросить точки</button>
 </div>
 </section>
+<section class="page" id="p-tests">
+<p class="hint" style="margin:0 0 14px">Каждый тест пишет начало и конец в журнал устройства. Время в строках — внутреннее время устройства, если оно синхронизировано со страницей, иначе — время с запуска.</p>
+<div class="glass card">
+<h3 style="margin:0 0 6px">Маркер в журнал</h3>
+<p class="hint" style="margin:0 0 12px">Записывает отметку в журнал. Нажмите перед нужным действием, чтобы найти момент в логе.</p>
+<button class="btn" data-test="marker">Записать маркер</button>
+</div>
+<div class="glass card">
+<h3 style="margin:0 0 6px">Состояние роли</h3>
+<p class="hint" style="margin:0 0 12px">Пишет роль, своя точка активна или нет, сохранённую сеть и связь с соседом. Без сканирования.</p>
+<button class="btn" data-test="role">Проверить роль</button>
+</div>
+<div class="glass card">
+<h3 style="margin:0 0 6px">Скан эфира</h3>
+<p class="hint" style="margin:0 0 12px">Один скан сетей: пишет все найденные точки и результат поиска точки настройки. Связь на несколько секунд прерывается.</p>
+<button class="btn" data-test="scan">Сканировать</button>
+</div>
+<div class="glass card">
+<h3 style="margin:0 0 6px">Тай-брейк: сброс обоих</h3>
+<p class="hint" style="margin:0 0 12px">Сбрасывает сеть на обоих устройствах: они перезагружаются почти одновременно. Через ~70 с после загрузки каждое пишет итог роли в журнал. Лог обоих устройств нужен для разбора.</p>
+<button class="btn dng" data-test="tiebreak">Запустить тай-брейк</button>
+</div>
+<div class="glass card">
+<h3 style="margin:0 0 6px">Проверка соседа</h3>
+<p class="hint" style="margin:0 0 12px">Запрос к соседу по адресу точки и по имени. Пишет ответ и время ответа.</p>
+<button class="btn" data-test="peer">Проверить соседа</button>
+</div>
+</section>
 <section class="page" id="p-sys">
 <div class="glass list">
 <div class="row"><span class="k">Устройство</span><span class="v" id="s-dev">—</span></div>
 <div class="row"><span class="k">Режим пары</span><span class="v" id="s-role">—</span></div>
 <div class="row"><span class="k">Второе устройство</span><span class="v" id="s-peer">—</span></div>
 <div class="row"><span class="k">Окно настройки</span><span class="v" id="s-win">—</span></div>
+<div class="row"><span class="k">Время устройства</span><span class="v" id="s-clock">—</span></div>
 </div>
 <h2>Сброс сети</h2>
 <div class="glass card">
 <p class="hint" style="margin:0 0 14px">Сбрасывает Wi-Fi на обоих устройствах, если второе отвечает. Оба перезагрузятся и заново найдут друг друга.</p>
 <button class="btn dng" id="b-reset">Сбросить сеть</button>
+</div>
+<h2>Перезагрузка</h2>
+<div class="glass card">
+<p class="hint" style="margin:0 0 14px">Перезагружает только это устройство. Сосед не затрагивается, сеть сохраняется.</p>
+<button class="btn" id="b-reboot">Перезагрузить</button>
 </div>
 <h2>События</h2>
 <div class="glass list" id="events"></div>
@@ -303,6 +365,7 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <button class="tab" role="tab" id="t-net" data-p="net" aria-selected="false"><svg viewBox="0 0 24 24"><use href="#i-wifi"/></svg>Сеть</button>
 <button class="tab" role="tab" id="t-cal" data-p="cal" aria-selected="false" style="display:none"><svg viewBox="0 0 24 24"><use href="#i-cal"/></svg>Калибровка</button>
 <button class="tab" role="tab" id="t-sys" data-p="sys" aria-selected="false"><svg viewBox="0 0 24 24"><use href="#i-sys"/></svg>Система</button>
+<button class="tab" role="tab" id="t-tests" data-p="tests" aria-selected="false"><svg viewBox="0 0 24 24"><use href="#i-check"/></svg>Тесты</button>
 </nav>
 <div class="toast glass" id="toast" role="status" aria-live="polite"></div>
 <div class="scrim" id="scrim">
@@ -359,7 +422,7 @@ finally{clearTimeout(id)}
 const post=(u,b,ms)=>api(u,b?{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(b)}:{method:'POST'},ms);
 function setBusy(b){busy=b;document.querySelectorAll('.btn,.net').forEach(x=>x.disabled=b)}
 /* ---------- разделы ---------- */
-const pages=['home','net','cal','sys'];
+const pages=['home','net','cal','sys','tests'];
 function go(p){
 if(!pages.includes(p)||(p==='cal'&&!isScale))p='home';
 pages.forEach(x=>{$('p-'+x).classList.toggle('on',x===p);$('t-'+x).setAttribute('aria-selected',x===p)});
@@ -413,13 +476,23 @@ $('h-st').textContent=j.status||'—';
 $('n-win').textContent=j.window?'Окно открыто: устройство принимает настройки сети от соседа.':'Окно закрыто. Пока оно закрыто, устройство не принимает новые настройки сети от соседа.';
 $('s-dev').textContent=title;$('s-role').textContent=j.role||'не определён';
 $('s-peer').textContent=peer;$('s-win').textContent=j.window?'Открыто':'Закрыто';
+$('s-clock').textContent=j.clock_ts?new Date(j.clock_ts*1000).toLocaleString('ru-RU'):'не задано';
 if(isScale)renderCurve(j.curve);
 if(j.status&&j.status!==lastSt){lastSt=j.status;if(j.status!=='Ожидание')logEv(j.status)}
 }
 async function refresh(){
 if(document.hidden)return;
-try{S=await api('/status');offline=0;render(S)}
+try{S=await api('/status');offline=0;render(S);syncClock(S)}
 catch(e){if(++offline>=2){chip('bad','Нет связи со страницей')}}
+}
+/* ---------- время ---------- */
+let lastClockTry=0;
+// У устройства нет часов с батареей и сети: время берём у телефона/ПК, на котором открыта страница
+function syncClock(j){
+const now=Math.floor(Date.now()/1000);
+if(Math.abs((j.clock_ts||0)-now)<=5||Date.now()-lastClockTry<10000)return;
+lastClockTry=Date.now();
+post('/time',{ts:now,tz:new Date().getTimezoneOffset()}).catch(()=>{});
 }
 /* ---------- панели ---------- */
 function show(id){
@@ -512,13 +585,28 @@ if(!v){say('Укажите известный вес');$('known').focus();return
 try{const j=await post('/calib',{known:v});say(j.msg)}catch(e){say('Нет связи с устройством')}
 setTimeout(refresh,1500);
 }
+async function rebootIt(){
+if(busy)return;
+if(!await ask('Перезагрузить?','Это устройство перезагрузится. Сосед не затрагивается.','Перезагрузить',true))return;
+setBusy(true);prog('Перезагрузка','Устройство перезагружается…');
+try{const j=await post('/reboot',null,5000);say(j.msg||'Перезагрузка',true)}
+catch(e){say('Устройство перезагружается…',true)}
+setBusy(false);closeSheet();
+}
+async function runTest(n){
+if(busy)return;
+try{const j=await post('/test',{name:n});say(j.msg||'Тест принят',true)}
+catch(e){say('Нет связи с устройством')}
+setTimeout(refresh,1500);
+}
 async function curveReset(){
 if(busy)return;
 if(!await ask('Сбросить точки?','Все точки калибровки будут удалены.','Сбросить',true))return;
 try{const j=await post('/curve_reset');say(j.msg)}catch(e){say('Нет связи с устройством')}
 setTimeout(refresh,1500);
 }
-$('b-open').onclick=openWin;$('b-reset').onclick=resetNet;$('b-scan').onclick=scan;
+$('b-open').onclick=openWin;$('b-reset').onclick=resetNet;$('b-scan').onclick=scan;$('b-reboot').onclick=rebootIt;
+document.querySelectorAll('[data-test]').forEach(b=>b.onclick=()=>runTest(b.dataset.test));
 $('b-zero').onclick=zeroIt;$('b-calib').onclick=calibIt;$('b-curve').onclick=curveReset;
 go(location.hash.slice(1));renderEv();refresh();
 setInterval(refresh,5000);
@@ -635,6 +723,10 @@ inline bool resolve_peer_host(std::string &ip) {
   return true;
 }
 
+// Клиент точки, который не оказался соседом (например, телефон), не опрашиваем чаще
+// раза в 10 минут. Раньше опрос был каждые 15 с и давал select() timeout в логе.
+inline constexpr uint32_t kNonPeerRecheckMs = 600000;
+
 inline bool probe_peer(std::string &peer_role) {
   const std::string expected = device_kind == "scale" ? "screen" : "scale";
   const std::string role = local_role();
@@ -664,7 +756,7 @@ inline bool probe_peer(std::string &peer_role) {
       if (peer_candidate_cache[j].valid &&
           memcmp(peer_candidate_cache[j].mac, pairs[i].mac, 6) == 0) {
         cache_slot = j;
-        if ((uint32_t) (now - peer_candidate_cache[j].checked_at) < 15000) break;
+        if ((uint32_t) (now - peer_candidate_cache[j].checked_at) < kNonPeerRecheckMs) break;
         cache_slot = j;
         break;
       }
@@ -672,7 +764,8 @@ inline bool probe_peer(std::string &peer_role) {
     }
     if (cache_slot >= 0 && peer_candidate_cache[cache_slot].valid &&
         memcmp(peer_candidate_cache[cache_slot].mac, pairs[i].mac, 6) == 0 &&
-        (uint32_t) (now - peer_candidate_cache[cache_slot].checked_at) < 15000)
+        (uint32_t) (now - peer_candidate_cache[cache_slot].checked_at) < kNonPeerRecheckMs &&
+        peer_candidate_cache[cache_slot].checked_at >= netrole::ap_join_ms)
       continue;
     char ip[16];
     snprintf(ip, sizeof(ip), IPSTR, IP2STR(&pairs[i].ip));
@@ -740,6 +833,9 @@ inline std::string status_json() {
   out += "\"ip\":\"" + ip + "\",";
   out += "\"signal\":\"" + signal + "\",";
   out += std::string("\"window\":") + (window_open() ? "true" : "false");
+  // Текущее время устройства (Unix, UTC) или 0, если время ещё не задано страницей
+  const long long clock_now = clock_set_at ? (long long) time(nullptr) : 0;
+  out += ",\"clock_ts\":" + std::to_string(clock_now);
   out += ",\"kind\":\"" + device_kind + "\"";
   out += ",\"title\":\"" + json_escape(device_title.c_str()) + "\"";
   bool checked = false, applicable = false, linked = false;
@@ -955,18 +1051,44 @@ static esp_err_t h_open(httpd_req_t *req) {
   return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
+// Сброс соседа: адрес зависит от сети (домашняя / setup-клиент / мастер с клиентами)
+inline bool reset_peer_now() {
+  if (prov::is_home_network(setup_ssid.c_str())) return prov_link::reset_peer_at(peer_host);
+  std::string sta_ssid;
+  const bool setup_client = netrole::saved_sta(sta_ssid) && setup_ssid.size() > 0 &&
+      sta_ssid == setup_ssid;
+  return setup_client ? prov_link::reset_peer_at(peer_ap_ip) : prov_link::reset_ap_clients();
+}
+
+// Метка «после сброса»: переживает перезагрузку (NVS), чтобы после загрузки записать итог роли
+inline void mark_reset_pending() {
+  nvs_handle_t h = 0;
+  if (nvs_open("ui_test", NVS_READWRITE, &h) != ESP_OK) return;
+  nvs_set_u8(h, "tb_pending", 1);
+  nvs_commit(h);
+  nvs_close(h);
+}
+// Метка читается при каждой загрузке и снимается только после записи итога:
+// если устройство перезагрузилось ещё раз (тай-брейк), итог будет после последней загрузки.
+inline bool reset_pending() {
+  nvs_handle_t h = 0;
+  if (nvs_open("ui_test", NVS_READWRITE, &h) != ESP_OK) return false;
+  uint8_t v = 0;
+  const bool had = nvs_get_u8(h, "tb_pending", &v) == ESP_OK && v == 1;
+  nvs_close(h);
+  return had;
+}
+inline void clear_reset_pending() {
+  nvs_handle_t h = 0;
+  if (nvs_open("ui_test", NVS_READWRITE, &h) != ESP_OK) return;
+  nvs_erase_key(h, "tb_pending");
+  nvs_commit(h);
+  nvs_close(h);
+}
+
 static esp_err_t h_reset(httpd_req_t *req) {
-  bool peer_reset = false;
-  if (prov::is_home_network(setup_ssid.c_str())) {
-    peer_reset = prov_link::reset_peer_at(peer_host);
-  } else {
-    std::string sta_ssid;
-    const bool setup_client = netrole::saved_sta(sta_ssid) && setup_ssid.size() > 0 &&
-        sta_ssid == setup_ssid;
-    peer_reset = setup_client
-        ? prov_link::reset_peer_at(peer_ap_ip)
-        : prov_link::reset_ap_clients();
-  }
+  const bool peer_reset = reset_peer_now();
+  mark_reset_pending();
 
   const char *msg = peer_reset
       ? "Сброс отправлен обоим устройствам, они перезагружаются"
@@ -982,8 +1104,138 @@ static esp_err_t h_reset(httpd_req_t *req) {
   return ESP_OK;
 }
 
+// ---- Тесты (страница «Тесты») ----
+// Каждый тест выполняется в отдельной задаче: сканирование и HTTP не должны
+// блокировать цикл ESPHome. Начало и конец пишутся в журнал со временем устройства.
+inline volatile bool test_busy = false;
+
+static const char *test_label(const std::string &n) {
+  if (n == "test_marker") return "маркер в журнал";
+  if (n == "test_role") return "состояние роли";
+  if (n == "test_scan") return "скан эфира";
+  if (n == "test_peer") return "проверка соседа";
+  if (n == "test_tiebreak") return "тай-брейк: сброс обоих";
+  return nullptr;
+}
+
+static void test_task(void *arg) {
+  char *name = static_cast<char *>(arg);
+  const char *label = test_label(name);
+  const std::string self = name;
+  ESP_LOGI(TAG_UI, "[%s] ТЕСТ НАЧАТ: %s", clock_stamp().c_str(), label ? label : self.c_str());
+  if (self == "test_marker") {
+    ESP_LOGI(TAG_UI, "[%s] МАРКЕР: отметка для поиска момента в журнале", clock_stamp().c_str());
+    set_status("Маркер записан в журнал");
+  } else if (self == "test_role") {
+    std::string saved;
+    const bool has_saved = netrole::saved_sta(saved);
+    ESP_LOGI(TAG_UI, "[%s] роль: %s", clock_stamp().c_str(), local_role().c_str());
+    ESP_LOGI(TAG_UI, "[%s] своя точка активна: %s; сохранённая сеть: %s; связь с соседом: %s",
+             clock_stamp().c_str(), netrole::own_ap_active() ? "да" : "нет",
+             has_saved ? saved.c_str() : "нет", peer_link_state ? "да" : "нет");
+    set_status("Состояние роли записано в журнал");
+  } else if (self == "test_scan") {
+    uint8_t bssid[6] = {0};
+    const bool found = netrole::find_bssid(setup_ssid, bssid);
+    ESP_LOGI(TAG_UI, "[%s] скан завершён: точка настройки %s", clock_stamp().c_str(),
+             found ? "найдена" : "не найдена");
+    set_status(found ? "Скан: точка настройки найдена" : "Скан: точка настройки не найдена");
+  } else if (self == "test_peer") {
+    const std::string hosts[2] = {peer_ap_ip, peer_host};
+    for (const std::string &host : hosts) {
+      if (host.empty()) continue;
+      std::string resp;
+      const std::string url = "http://" + host + "/peer_identity";
+      const uint32_t t0 = now_ms();
+      const bool ok = prov_link::get_request(url, resp, 2000);
+      ESP_LOGI(TAG_UI, "[%s] сосед %s: %s, %u байт, %lu мс", clock_stamp().c_str(), host.c_str(),
+               ok ? "ответил" : "не ответил", (unsigned) resp.size(),
+               (unsigned long) (now_ms() - t0));
+    }
+    set_status("Проверка соседа записана в журнал");
+  } else if (self == "test_tiebreak") {
+    ESP_LOGI(TAG_UI, "[%s] сброс обоих: команда соседу и перезагрузка этого устройства", clock_stamp().c_str());
+    const bool peer_ok = reset_peer_now();
+    ESP_LOGI(TAG_UI, "[%s] сосед %s", clock_stamp().c_str(),
+             peer_ok ? "принял сброс" : "не ответил: сбрасывается только это устройство");
+    mark_reset_pending();
+    set_status("Сброс: перезагрузка для теста тай-брейка");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    if (on_reset) on_reset();  // перезагрузка; итог роли запишется после загрузки
+  }
+  ESP_LOGI(TAG_UI, "[%s] ТЕСТ ЗАВЕРШЁН: %s", clock_stamp().c_str(), label ? label : self.c_str());
+  free(name);
+  test_busy = false;
+  vTaskDelete(nullptr);
+}
+
+// После загрузки, если перед ней был сброс: через 70 с (роль и 45-секундная проверка) пишем итог
+inline void tiebreak_check_task(void *) {
+  vTaskDelay(pdMS_TO_TICKS(70000));
+  std::string saved;
+  const bool has_saved = netrole::saved_sta(saved);
+  ESP_LOGI(TAG_UI, "[%s] ТЕСТ ТАЙ-БРЕЙК, итог после сброса: роль=%s; своя точка активна=%s; сохранённая сеть=%s; связь с соседом=%s",
+           clock_stamp().c_str(), local_role().c_str(), netrole::own_ap_active() ? "да" : "нет",
+           has_saved ? saved.c_str() : "нет", peer_link_state ? "да" : "нет");
+  clear_reset_pending();
+  vTaskDelete(nullptr);
+}
+
+inline void run_test(const std::string &name) {
+  if (!test_label(name)) return;
+  if (test_busy) {
+    set_status("Тест уже выполняется");
+    return;
+  }
+  test_busy = true;
+  char *copy = strdup(name.c_str());
+  if (copy == nullptr || xTaskCreate(test_task, "ui_test", 8192, copy, 2, nullptr) != pdPASS) {
+    free(copy);
+    test_busy = false;
+    set_status("Не удалось запустить тест");
+  }
+}
+
+static esp_err_t h_test(httpd_req_t *req) {
+  std::string b;
+  if (recv_body(req, b, 100) < 0) return reply_msg(req, "Ошибка запроса");
+  const std::string name = "test_" + form_value(b, "name");
+  if (!test_label(name)) return reply_msg(req, "Неизвестный тест");
+  return queue_cmd(req, name.c_str(), 0.0f, true);
+}
+
+// Перезагрузка по кнопке. Ответ уходит до перезагрузки; запись в журнал устройства.
+static esp_err_t h_reboot(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  if (!on_reboot) return reply_msg(req, "Перезагрузка не поддерживается");
+  ESP_LOGW(TAG_UI, "reboot requested from web page");
+  set_status("Перезагрузка по команде со страницы");
+  httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"Перезагрузка\"}");
+  vTaskDelay(pdMS_TO_TICKS(250));
+  on_reboot();
+  return ESP_OK;
+}
+
+// Установка времени со страницы (поле ts: Unix-секунды, UTC). Принимаем только разумные значения.
+static esp_err_t h_time(httpd_req_t *req) {
+  std::string b;
+  if (recv_body(req, b, 100) < 0) return reply_msg(req, "Ошибка запроса");
+  const long long ts = strtoll(form_value(b, "ts").c_str(), nullptr, 10);
+  if (ts < 1704067200LL || ts > 4102444800LL) return reply_msg(req, "Неверное время");
+  struct timeval tv = {};
+  tv.tv_sec = (time_t) ts;
+  tv.tv_usec = 0;
+  if (settimeofday(&tv, nullptr) != 0) return reply_msg(req, "Не удалось установить время");
+  const std::string tz = form_value(b, "tz");
+  if (!tz.empty()) clock_tz_min = (int) strtol(tz.c_str(), nullptr, 10);
+  clock_set_at = ts;
+  ESP_LOGI(TAG_UI, "[%s] время задано со страницы", clock_stamp().c_str());
+  return reply_msg(req, "Время установлено");
+}
+
 // Команда от соседа. Отвечает до сброса и не пересылает команду обратно.
 static esp_err_t h_peer_reset(httpd_req_t *req) {
+  mark_reset_pending();
   set_status("Сосед запросил сброс сети");
   httpd_resp_set_type(req, "application/json; charset=utf-8");
   httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"Сброс принят\"}");
@@ -1094,7 +1346,19 @@ inline void start(int port) {
   u = {};
   u.uri = "/curve_reset"; u.method = HTTP_POST; u.handler = h_curve_reset;
   reg_uri(srv, u);
+  u = {};
+  u.uri = "/reboot"; u.method = HTTP_POST; u.handler = h_reboot;
+  reg_uri(srv, u);
+  u = {};
+  u.uri = "/time"; u.method = HTTP_POST; u.handler = h_time;
+  reg_uri(srv, u);
+  u = {};
+  u.uri = "/test"; u.method = HTTP_POST; u.handler = h_test;
+  reg_uri(srv, u);
 
+  if (reset_pending()) {
+    xTaskCreate(tiebreak_check_task, "tb_check", 8192, nullptr, 1, nullptr);
+  }
   ESP_LOGI(TAG_UI, "UI started on port %d", port);
 }
 

@@ -204,17 +204,51 @@ h2{margin:24px 8px 10px;font-size:13px;font-weight:600;letter-spacing:.06em;text
   </div>
 </section>
 
+<section class="page" id="p-tests">
+  <p class="hint" style="margin:0 0 14px">Каждый тест пишет начало и конец в журнал устройства. Время в строках — внутреннее время устройства, если оно синхронизировано со страницей, иначе — время с запуска.</p>
+  <div class="glass card">
+    <h3 style="margin:0 0 6px">Маркер в журнал</h3>
+    <p class="hint" style="margin:0 0 12px">Записывает отметку в журнал. Нажмите перед нужным действием, чтобы найти момент в логе.</p>
+    <button class="btn" data-test="marker">Записать маркер</button>
+  </div>
+  <div class="glass card">
+    <h3 style="margin:0 0 6px">Состояние роли</h3>
+    <p class="hint" style="margin:0 0 12px">Пишет роль, своя точка активна или нет, сохранённую сеть и связь с соседом. Без сканирования.</p>
+    <button class="btn" data-test="role">Проверить роль</button>
+  </div>
+  <div class="glass card">
+    <h3 style="margin:0 0 6px">Скан эфира</h3>
+    <p class="hint" style="margin:0 0 12px">Один скан сетей: пишет все найденные точки и результат поиска точки настройки. Связь на несколько секунд прерывается.</p>
+    <button class="btn" data-test="scan">Сканировать</button>
+  </div>
+  <div class="glass card">
+    <h3 style="margin:0 0 6px">Тай-брейк: сброс обоих</h3>
+    <p class="hint" style="margin:0 0 12px">Сбрасывает сеть на обоих устройствах: они перезагружаются почти одновременно. Через ~70 с после загрузки каждое пишет итог роли в журнал. Лог обоих устройств нужен для разбора.</p>
+    <button class="btn dng" data-test="tiebreak">Запустить тай-брейк</button>
+  </div>
+  <div class="glass card">
+    <h3 style="margin:0 0 6px">Проверка соседа</h3>
+    <p class="hint" style="margin:0 0 12px">Запрос к соседу по адресу точки и по имени. Пишет ответ и время ответа.</p>
+    <button class="btn" data-test="peer">Проверить соседа</button>
+  </div>
+</section>
 <section class="page" id="p-sys">
   <div class="glass list">
     <div class="row"><span class="k">Устройство</span><span class="v" id="s-dev">—</span></div>
     <div class="row"><span class="k">Режим пары</span><span class="v" id="s-role">—</span></div>
     <div class="row"><span class="k">Второе устройство</span><span class="v" id="s-peer">—</span></div>
     <div class="row"><span class="k">Окно настройки</span><span class="v" id="s-win">—</span></div>
+    <div class="row"><span class="k">Время устройства</span><span class="v" id="s-clock">—</span></div>
   </div>
   <h2>Сброс сети</h2>
   <div class="glass card">
     <p class="hint" style="margin:0 0 14px">Сбрасывает Wi-Fi на обоих устройствах, если второе отвечает. Оба перезагрузятся и заново найдут друг друга.</p>
     <button class="btn dng" id="b-reset">Сбросить сеть</button>
+  </div>
+  <h2>Перезагрузка</h2>
+  <div class="glass card">
+    <p class="hint" style="margin:0 0 14px">Перезагружает только это устройство. Сосед не затрагивается, сеть сохраняется.</p>
+    <button class="btn" id="b-reboot">Перезагрузить</button>
   </div>
   <h2>События</h2>
   <div class="glass list" id="events"></div>
@@ -227,6 +261,7 @@ h2{margin:24px 8px 10px;font-size:13px;font-weight:600;letter-spacing:.06em;text
   <button class="tab" role="tab" id="t-net" data-p="net" aria-selected="false"><svg viewBox="0 0 24 24"><use href="#i-wifi"/></svg>Сеть</button>
   <button class="tab" role="tab" id="t-cal" data-p="cal" aria-selected="false" style="display:none"><svg viewBox="0 0 24 24"><use href="#i-cal"/></svg>Калибровка</button>
   <button class="tab" role="tab" id="t-sys" data-p="sys" aria-selected="false"><svg viewBox="0 0 24 24"><use href="#i-sys"/></svg>Система</button>
+  <button class="tab" role="tab" id="t-tests" data-p="tests" aria-selected="false"><svg viewBox="0 0 24 24"><use href="#i-check"/></svg>Тесты</button>
 </nav>
 
 <div class="toast glass" id="toast" role="status" aria-live="polite"></div>
@@ -289,7 +324,7 @@ const post=(u,b,ms)=>api(u,b?{method:'POST',headers:{'Content-Type':'application
 function setBusy(b){busy=b;document.querySelectorAll('.btn,.net').forEach(x=>x.disabled=b)}
 
 /* ---------- разделы ---------- */
-const pages=['home','net','cal','sys'];
+const pages=['home','net','cal','sys','tests'];
 function go(p){
   if(!pages.includes(p)||(p==='cal'&&!isScale))p='home';
   pages.forEach(x=>{$('p-'+x).classList.toggle('on',x===p);$('t-'+x).setAttribute('aria-selected',x===p)});
@@ -344,13 +379,24 @@ function render(j){
   $('n-win').textContent=j.window?'Окно открыто: устройство принимает настройки сети от соседа.':'Окно закрыто. Пока оно закрыто, устройство не принимает новые настройки сети от соседа.';
   $('s-dev').textContent=title;$('s-role').textContent=j.role||'не определён';
   $('s-peer').textContent=peer;$('s-win').textContent=j.window?'Открыто':'Закрыто';
+  $('s-clock').textContent=j.clock_ts?new Date(j.clock_ts*1000).toLocaleString('ru-RU'):'не задано';
   if(isScale)renderCurve(j.curve);
   if(j.status&&j.status!==lastSt){lastSt=j.status;if(j.status!=='Ожидание')logEv(j.status)}
 }
 async function refresh(){
   if(document.hidden)return;
-  try{S=await api('/status');offline=0;render(S)}
+  try{S=await api('/status');offline=0;render(S);syncClock(S)}
   catch(e){if(++offline>=2){chip('bad','Нет связи со страницей')}}
+}
+
+/* ---------- время ---------- */
+let lastClockTry=0;
+// У устройства нет часов с батареей и сети: время берём у телефона/ПК, на котором открыта страница
+function syncClock(j){
+  const now=Math.floor(Date.now()/1000);
+  if(Math.abs((j.clock_ts||0)-now)<=5||Date.now()-lastClockTry<10000)return;
+  lastClockTry=Date.now();
+  post('/time',{ts:now,tz:new Date().getTimezoneOffset()}).catch(()=>{});
 }
 
 /* ---------- панели ---------- */
@@ -445,13 +491,28 @@ async function calibIt(){
   try{const j=await post('/calib',{known:v});say(j.msg)}catch(e){say('Нет связи с устройством')}
   setTimeout(refresh,1500);
 }
+async function rebootIt(){
+  if(busy)return;
+  if(!await ask('Перезагрузить?','Это устройство перезагрузится. Сосед не затрагивается.','Перезагрузить',true))return;
+  setBusy(true);prog('Перезагрузка','Устройство перезагружается…');
+  try{const j=await post('/reboot',null,5000);say(j.msg||'Перезагрузка',true)}
+  catch(e){say('Устройство перезагружается…',true)}
+  setBusy(false);closeSheet();
+}
+async function runTest(n){
+  if(busy)return;
+  try{const j=await post('/test',{name:n});say(j.msg||'Тест принят',true)}
+  catch(e){say('Нет связи с устройством')}
+  setTimeout(refresh,1500);
+}
 async function curveReset(){
   if(busy)return;
   if(!await ask('Сбросить точки?','Все точки калибровки будут удалены.','Сбросить',true))return;
   try{const j=await post('/curve_reset');say(j.msg)}catch(e){say('Нет связи с устройством')}
   setTimeout(refresh,1500);
 }
-$('b-open').onclick=openWin;$('b-reset').onclick=resetNet;$('b-scan').onclick=scan;
+$('b-open').onclick=openWin;$('b-reset').onclick=resetNet;$('b-scan').onclick=scan;$('b-reboot').onclick=rebootIt;
+document.querySelectorAll('[data-test]').forEach(b=>b.onclick=()=>runTest(b.dataset.test));
 $('b-zero').onclick=zeroIt;$('b-calib').onclick=calibIt;$('b-curve').onclick=curveReset;
 
 go(location.hash.slice(1));renderEv();refresh();
