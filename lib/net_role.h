@@ -205,11 +205,21 @@ inline bool find_bssid(const std::string &target, uint8_t out[6]) {
   return false;
 }
 
+// Своя точка доступа реально работает: режим драйвера включает AP. Флаг
+// own_ap_started ставится по событию AP_START, которое может прийти раньше,
+// чем зарегистрирован обработчик логов (тогда флаг останется ложным и устройство
+// ошибочно присоединится к соседней AP). Поэтому проверяем сам драйвер.
+inline bool own_ap_active() {
+  wifi_mode_t mode = WIFI_MODE_NULL;
+  if (esp_wifi_get_mode(&mode) != ESP_OK) return own_ap_started.load();
+  return mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA;
+}
+
 // If our fallback AP has not started yet, the discovered peer is already
 // established: join it regardless of MAC. Use MAC only to break the tie when
 // both devices independently started their fallback APs before seeing each other.
 inline bool should_join_as_client(const uint8_t found[6]) {
-  if (!own_ap_started.load()) {
+  if (!own_ap_active()) {
     char peer_s[18];
     mac_text(found, peer_s);
     ESP_LOGI(TAG_NR, "peer AP %s already active; own AP not started -> STA client",
