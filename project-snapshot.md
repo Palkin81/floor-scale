@@ -39,7 +39,7 @@
 - Не решено: ответы `/connect` синхронны (проба до 30 с); автонуль на весах отсутствует; один ключ открывает API, OTA и шифрование кредов; первый скан экрана после старта иногда возвращает 0 точек (ESPHome подключается сам); fallback AP через `ap_timeout: 40s` не проверен отдельно.
 
 Текущий результат:
-- Ветка `fix/role-selection` на `origin`: `083e9bc` (тесты, тай-брейк, редкий опрос не-соседей). `main` = `a59c987`.
+- Ветка `fix/role-selection` на `origin`: `85b9ef0` (снимок и план поверх `083e9bc`: тесты, тай-брейк, редкий опрос не-соседей). `main` = `a59c987`.
 - Файлы: `lib/net_role.h` (`own_ap_active`, `should_join_as_client`, `clear_saved_sta`, `saved_sta`, `find_bssid`), `lib/ui_server.h` (HTTP, тесты, метка сброса, `peer_monitor`, `probe_peer`, `reset_peer_now`, `clock_stamp`), `floor-scale.yaml` и `screen_stub.yaml` (`pick_role`, `interval` с `run_pending`, `on_reboot`, `on_reset`), `ui/page.html` и `ui/embed.py`, `plan.md`, `project-snapshot.md`.
 - Ключевые фрагменты:
 
