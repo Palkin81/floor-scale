@@ -113,7 +113,7 @@ esphome:
             for (int i = 0; i < 11; i++) {
               char *end = nullptr;
               v[i] = strtof(p, &end);
-              if (end == p || isnan(v[i]) || isinf(v[i])) return "Калибровка в файле повреждена";
+              if (end == p || !std::isfinite(v[i])) return "Калибровка в файле повреждена";
               const bool is_kg = i > 0 && (i % 2) == 1;
               if (is_kg ? (v[i] < 0.0f || v[i] > 300.0f) : fabsf(v[i]) > 10000000.0f)
                 return "Калибровка в файле вне допустимых пределов";
