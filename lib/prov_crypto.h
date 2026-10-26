@@ -41,21 +41,25 @@ inline bool hex_to_bytes(const std::string &h, std::vector<uint8_t> &out) {
   return true;
 }
 
-// true, если блок расшифрован и тег совпал.
-inline bool decrypt(const char *key_b64, const std::string &blob_hex,
-                    std::string &ssid, std::string &pass) {
+inline bool load_key(const char *key_b64, uint8_t key[32]) {
+  size_t klen = 0;
+  if (mbedtls_base64_decode(key, 32, &klen, (const unsigned char *) key_b64, strlen(key_b64)) != 0 ||
+      klen != 32) {
+    ESP_LOGE(TAG_PROV, "Bad prov key (need base64 of 32 bytes)");
+    return false;
+  }
+  return true;
+}
+
+// Расшифровывает произвольный текст из блока hex(nonce | tag | ciphertext).
+// true, если тег совпал.
+inline bool decrypt_text(const char *key_b64, const std::string &blob_hex, std::string &plain_out) {
   std::vector<uint8_t> blob;
   if (!hex_to_bytes(blob_hex, blob)) return false;
   if (blob.size() < 12 + 16 + 1) return false;
 
   uint8_t key[32];
-  size_t klen = 0;
-  if (mbedtls_base64_decode(key, sizeof(key), &klen,
-                            (const unsigned char *) key_b64, strlen(key_b64)) != 0 ||
-      klen != 32) {
-    ESP_LOGE(TAG_PROV, "Bad prov key (need base64 of 32 bytes)");
-    return false;
-  }
+  if (!load_key(key_b64, key)) return false;
 
   const uint8_t *iv = blob.data();
   const uint8_t *tag = blob.data() + 12;
@@ -75,34 +79,16 @@ inline bool decrypt(const char *key_b64, const std::string &blob_hex,
     ESP_LOGW(TAG_PROV, "GCM auth failed (wrong key or tampered data)");
     return false;
   }
-
-  std::string s((const char *) plain.data(), clen);
-  size_t p1 = s.find('\n');
-  if (p1 == std::string::npos) return false;
-
-  ssid = s.substr(0, p1);
-  pass = s.substr(p1 + 1);
-
-  if (ssid.empty() || ssid.size() > 32 || pass.size() > 64) return false;
+  plain_out.assign((const char *) plain.data(), clen);
   return true;
 }
 
-// Шифрует сетевые данные для передачи соседу в том же формате, который
-// принимает POST /prov: hex(nonce | tag | ciphertext).
-inline bool encrypt(const char *key_b64, const std::string &ssid,
-                    const std::string &pass, std::string &blob_hex) {
-  if (ssid.empty() || ssid.size() > 32 || pass.size() > 64) return false;
-
+// Шифрует произвольный текст в блок hex(nonce | tag | ciphertext).
+inline bool encrypt_text(const char *key_b64, const std::string &plain, std::string &blob_hex) {
+  if (plain.empty()) return false;
   uint8_t key[32];
-  size_t klen = 0;
-  if (mbedtls_base64_decode(key, sizeof(key), &klen,
-                            (const unsigned char *) key_b64, strlen(key_b64)) != 0 ||
-      klen != 32) {
-    ESP_LOGE(TAG_PROV, "Bad prov key (need base64 of 32 bytes)");
-    return false;
-  }
+  if (!load_key(key_b64, key)) return false;
 
-  const std::string plain = ssid + "\n" + pass;
   uint8_t nonce[12];
   uint8_t tag[16];
   std::vector<uint8_t> cipher(plain.size());
@@ -134,6 +120,29 @@ inline bool encrypt(const char *key_b64, const std::string &ssid,
   append_hex(tag, sizeof(tag));
   append_hex(cipher.data(), cipher.size());
   return true;
+}
+
+// true, если блок расшифрован и тег совпал; формат текста "<ssid>\n<password>".
+inline bool decrypt(const char *key_b64, const std::string &blob_hex,
+                    std::string &ssid, std::string &pass) {
+  std::string s;
+  if (!decrypt_text(key_b64, blob_hex, s)) return false;
+  size_t p1 = s.find('\n');
+  if (p1 == std::string::npos) return false;
+
+  ssid = s.substr(0, p1);
+  pass = s.substr(p1 + 1);
+
+  if (ssid.empty() || ssid.size() > 32 || pass.size() > 64) return false;
+  return true;
+}
+
+// Шифрует сетевые данные для передачи соседу в том же формате, который
+// принимает POST /prov: hex(nonce | tag | ciphertext).
+inline bool encrypt(const char *key_b64, const std::string &ssid,
+                    const std::string &pass, std::string &blob_hex) {
+  if (ssid.empty() || ssid.size() > 32 || pass.size() > 64) return false;
+  return encrypt_text(key_b64, ssid + "\n" + pass, blob_hex);
 }
 
 }  // namespace prov

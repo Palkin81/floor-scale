@@ -61,6 +61,26 @@ inline bool post_request(const std::string &url, const std::string &body, int ti
   return accepted;
 }
 
+// POST с произвольным телом; ответ возвращается в response. true — HTTP 200.
+inline bool post_text(const std::string &url, const std::string &body, std::string &response,
+                      const char *content_type = "application/x-www-form-urlencoded",
+                      int timeout_ms = 2500) {
+  esp_http_client_config_t cfg = {};
+  cfg.url = url.c_str();
+  cfg.method = HTTP_METHOD_POST;
+  cfg.timeout_ms = timeout_ms;
+  cfg.event_handler = collect_response;
+  cfg.user_data = &response;
+  esp_http_client_handle_t client = esp_http_client_init(&cfg);
+  if (client == nullptr) return false;
+  esp_http_client_set_header(client, "Content-Type", content_type);
+  esp_http_client_set_post_field(client, body.data(), body.size());
+  esp_err_t err = esp_http_client_perform(client);
+  int status = esp_http_client_get_status_code(client);
+  esp_http_client_cleanup(client);
+  return err == ESP_OK && status == 200;
+}
+
 inline bool post_blob(const std::string &ip, const std::string &blob) {
   return post_request("http://" + ip + "/prov", blob);
 }
