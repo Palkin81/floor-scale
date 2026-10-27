@@ -8,6 +8,7 @@
 #include <functional>
 #include <cmath>
 #include <string.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/time.h>
@@ -102,7 +103,58 @@ inline void close_window() { window_until = 0; }
 inline bool window_open() {
   return window_until != 0 && (int32_t) (now_ms() - window_until) < 0;
 }
-inline void set_status(const std::string &s) { snprintf(status_buf, sizeof(status_buf), "%s", s.c_str()); }
+// ---- Журнал событий для раздела «События» на странице ----
+// Кольцо из 24 записей; страница забирает новые по GET /events?after=<id>.
+// Сюда попадают смена статуса, результаты тестов, ошибки и смена связи с соседом.
+struct UiEvent {
+  uint32_t id;
+  long long ts;     // Unix-время, если часы заданы страницей, иначе 0
+  uint32_t up_s;    // секунд с запуска
+  char lvl;         // 'i' информация, 'w' предупреждение, 'e' ошибка
+  char text[140];
+};
+inline constexpr int kEvCount = 24;
+inline UiEvent ev_ring[kEvCount] = {};
+inline uint32_t ev_last_id = 0;
+inline SemaphoreHandle_t ev_lock = nullptr;
+
+inline void add_event(char lvl, const char *text) {
+  if (ev_lock == nullptr) ev_lock = xSemaphoreCreateMutex();
+  if (ev_lock == nullptr || xSemaphoreTake(ev_lock, pdMS_TO_TICKS(50)) != pdTRUE) return;
+  const UiEvent &prev = ev_ring[(ev_last_id + kEvCount - 1) % kEvCount];
+  if (!(ev_last_id > 0 && prev.lvl == lvl && strncmp(prev.text, text, sizeof(prev.text) - 1) == 0)) {
+    UiEvent &e = ev_ring[ev_last_id % kEvCount];
+    e.id = ++ev_last_id;
+    e.ts = clock_set_at ? (long long) time(nullptr) : 0;
+    e.up_s = (uint32_t) (esp_timer_get_time() / 1000000);
+    e.lvl = lvl;
+    snprintf(e.text, sizeof(e.text), "%s", text);
+  }
+  xSemaphoreGive(ev_lock);
+}
+
+// Пишет и в журнал устройства, и в «События». Формат как у printf; префикс "[время] " в событие не попадает.
+inline void evlog(char lvl, const char *fmt, ...) {
+  char buf[200];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (lvl == 'e') ESP_LOGE(TAG_UI, "%s", buf);
+  else if (lvl == 'w') ESP_LOGW(TAG_UI, "%s", buf);
+  else ESP_LOGI(TAG_UI, "%s", buf);
+  const char *t = buf;
+  if (buf[0] == '[') {
+    const char *c = strstr(buf, "] ");
+    if (c != nullptr) t = c + 2;
+  }
+  add_event(lvl, t);
+}
+
+inline void set_status(const std::string &s) {
+  if (s != status_buf && s != "Ожидание") add_event('i', s.c_str());
+  snprintf(status_buf, sizeof(status_buf), "%s", s.c_str());
+}
 
 // Команды калибровки: httpd только ставит в очередь, выполняет цикл ESPHome (run_pending)
 inline volatile bool cmd_pending = false;
@@ -162,7 +214,10 @@ static const char PAGE[] = R"HTML(
 --base:#090c17;--b1:#1c3d8c;--b2:#552d8e;--b3:#0e5a64;
 }}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html{-webkit-text-size-adjust:100%;overflow-y:scroll;scrollbar-gutter:stable}
+html{-webkit-text-size-adjust:100%}
+@media (hover:hover) and (pointer:fine){html{overflow-y:scroll}}
+::-webkit-scrollbar{width:0;height:0;background:transparent}
+html{scrollbar-width:none}
 body{margin:0;min-height:100vh;color:var(--text);-webkit-font-smoothing:antialiased;
 font:16px/1.4 -apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","Helvetica Neue",system-ui,"Segoe UI",Roboto,sans-serif;
 background:var(--base)}
@@ -175,6 +230,7 @@ box-shadow:var(--shadow),inset 0 1px 0 var(--stroke),inset 0 0 0 1px var(--strok
 .glass::before{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;opacity:var(--sheen);
 background:linear-gradient(145deg,rgba(255,255,255,.4),rgba(255,255,255,0) 40%)}
 .glass>*{position:relative}
+@media (max-width:700px){.glass{-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px)}.glass::before{display:none}}
 @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){.glass{background:var(--glass2)}}
 .top{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:4px 4px 20px}
 h1{margin:0;font-size:34px;line-height:1.1;font-weight:700;letter-spacing:-.02em}
@@ -207,7 +263,7 @@ h2{margin:24px 8px 10px;font-size:13px;font-weight:600;letter-spacing:.06em;text
 .btn{appearance:none;font:inherit;font-weight:600;font-size:17px;min-height:52px;padding:0 20px;width:100%;cursor:pointer;
 display:flex;align-items:center;justify-content:center;gap:9px;color:var(--text);
 background:var(--field);border:1px solid var(--stroke);border-radius:17px;
--webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);transition:transform .12s,opacity .2s}
+transition:transform .12s,opacity .2s}
 .btn:active{transform:scale(.975)}
 .btn:disabled{opacity:.45;pointer-events:none}
 .btn.pri{color:#fff;background:linear-gradient(180deg,#4aa3ff,#0a7aff);border-color:rgba(255,255,255,.38);box-shadow:0 8px 20px rgba(10,122,255,.34),inset 0 1px 0 rgba(255,255,255,.4)}
@@ -234,6 +290,8 @@ background:var(--field);border:1px solid var(--stroke);border-radius:17px;
 .empty{padding:22px 18px;text-align:center;color:var(--text2)}
 .ev{display:flex;gap:14px;padding:11px 0;border-bottom:1px solid var(--sep);font-size:14px}
 .ev:last-child{border-bottom:0}
+.ev.e span{color:var(--red)}
+.ev.w span{color:var(--orange)}
 .ev time{color:var(--text3);font-variant-numeric:tabular-nums;flex:none}
 .back{appearance:none;border:0;background:none;color:var(--blue);font:inherit;font-weight:600;font-size:17px;padding:6px 8px;margin:-6px 0 8px -8px;cursor:pointer}
 .net .v{color:var(--text2);font-size:15px;flex:none}
@@ -479,20 +537,32 @@ document.getElementById('inst-text').textContent=ios
 let S={},W=null,offline=0,isScale=false,busy=false,pend='',askRes=null,cur=null,tt,ready=false,lastSt='';
 const events=[];
 /* ---------- сообщения ---------- */
-function logEv(t){
-if(!t||(events[0]&&events[0].t===t))return;
-events.unshift({t:t,at:new Date()});if(events.length>30)events.pop();renderEv();
+function logEv(t,l,at){
+if(!t||(!at&&events[0]&&events[0].t===t&&events[0].l===(l||'i')))return;
+events.unshift({t:t,l:l||'i',at:at||new Date()});if(events.length>60)events.pop();renderEv();
+}
+let lastEv=0;
+async function pullEvents(){
+const j=await api('/events?after='+lastEv);
+if(j.last<lastEv)lastEv=0;            // устройство перезагрузилось: нумерация началась заново
+(j.ev||[]).forEach(e=>{
+if(e.i<=lastEv)return;
+lastEv=e.i;
+const at=e.t?new Date(e.t*1000):new Date();
+logEv(e.m,e.l,at);
+});
 }
 function renderEv(){
 const b=$('events');clear(b);
 if(!events.length){b.append(el('div','empty','Пока нет событий'));return}
-events.forEach(e=>{const r=el('div','ev');r.append(el('time',null,e.at.toLocaleTimeString('ru-RU')),el('span',null,e.t));b.append(r)});
+events.forEach(e=>{const r=el('div','ev'+(e.l==='e'?' e':e.l==='w'?' w':''));r.append(el('time',null,e.at.toLocaleTimeString('ru-RU')),el('span',null,e.t));b.append(r)});
 }
 function say(t,keep){
 const s=$('toast');clearTimeout(tt);
 if(!t){s.classList.remove('on');return}
-s.textContent=t;s.classList.add('on');logEv(t);
-if(!keep)tt=setTimeout(()=>s.classList.remove('on'),7000);
+s.textContent=t;s.classList.add('on');
+if(!/^Команда принята/.test(t))logEv(t,/Нет связи|Ошибка|Не удалось|не ответ|не найден|не на связи|повреждена|не подходит|слишком большой/i.test(t)?'e':'i');
+tt=setTimeout(()=>s.classList.remove('on'),keep?6500:2800);
 }
 $('toast').onclick=()=>say('');
 /* ---------- запросы ---------- */
@@ -582,11 +652,10 @@ vis('tc-pd',!isScale);
 // калибровка
 vis('cal-note',!W);
 if(W)renderCurve(W.curve);else renderCurve('');
-if(j.status&&j.status!==lastSt){lastSt=j.status;if(j.status!=='Ожидание')logEv(j.status)}
 }
 async function refresh(){
 if(document.hidden)return;
-try{S=await api('/status');offline=0;render(S);syncClock(S)}
+try{S=await api('/status');offline=0;render(S);syncClock(S);pullEvents().catch(()=>{})}
 catch(e){if(++offline>=2){chip('bad','Нет связи со страницей')}}
 }
 /* ---------- время ---------- */
@@ -980,6 +1049,13 @@ inline void peer_monitor_task(void *) {
       snprintf(peer_ip_buf, sizeof(peer_ip_buf), "%s", linked ? probe_ip.c_str() : "");
       xSemaphoreGive(peer_status_lock);
     }
+    if (!keep_state && applicable) {
+      static bool prev_known = false, prev_linked = false;
+      if (!prev_known || linked != prev_linked)
+        evlog(linked ? 'i' : 'w', "Связь с соседом: %s", linked ? "есть" : "потеряна");
+      prev_known = true;
+      prev_linked = linked;
+    }
     uint32_t wait = 5000;
     if (own_role == "Домашняя сеть") wait = (linked && peer_misses == 0) ? 30000 : 8000;
     vTaskDelay(pdMS_TO_TICKS(wait));
@@ -1133,7 +1209,7 @@ static esp_err_t h_peer_identity(httpd_req_t *req) {
 }
 
 static esp_err_t send_scan_error(httpd_req_t *req, const char *where, esp_err_t e) {
-  ESP_LOGE(TAG_UI, "%s failed: %s", where, esp_err_to_name(e));
+  evlog('e', "%s failed: %s", where, esp_err_to_name(e));
   char err[160];
   snprintf(err, sizeof(err), "{\"error\":\"%s: %s\"}", where, esp_err_to_name(e));
   httpd_resp_set_type(req, "application/json; charset=utf-8");
@@ -1257,6 +1333,39 @@ static esp_err_t reply_err(httpd_req_t *req, const std::string &m) {
 }
 
 // Экран пересылает команды калибровки весам. Адрес берём у проверки связи.
+// Новые события для страницы: GET /events?after=<последний полученный id>
+static esp_err_t h_events(httpd_req_t *req) {
+  uint32_t after = 0;
+  char q[48];
+  if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+    char v[16];
+    if (httpd_query_key_value(q, "after", v, sizeof(v)) == ESP_OK) after = (uint32_t) strtoul(v, nullptr, 10);
+  }
+  std::string out = "{\"ev\":[";
+  uint32_t last = 0;
+  if (ev_lock != nullptr && xSemaphoreTake(ev_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+    last = ev_last_id;
+    uint32_t first = after + 1;
+    if (last >= (uint32_t) kEvCount && first < last - kEvCount + 1) first = last - kEvCount + 1;
+    bool comma = false;
+    for (uint32_t id = first; id <= last; id++) {
+      const UiEvent &e = ev_ring[(id - 1) % kEvCount];
+      if (e.id != id) continue;
+      char head[96];
+      snprintf(head, sizeof(head), "%s{\"i\":%lu,\"t\":%lld,\"u\":%lu,\"l\":\"%c\",\"m\":\"", comma ? "," : "",
+               (unsigned long) e.id, e.ts, (unsigned long) e.up_s, e.lvl);
+      out += head;
+      out += json_escape(e.text);
+      out += "\"}";
+      comma = true;
+    }
+    xSemaphoreGive(ev_lock);
+  }
+  out += "],\"last\":" + std::to_string(last) + "}";
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  return httpd_resp_send(req, out.c_str(), out.size());
+}
+
 static esp_err_t h_peer_cmd(httpd_req_t *req) {
   std::string b;
   if (recv_body(req, b, 200) < 0) return reply_err(req, "Ошибка запроса");
@@ -1544,22 +1653,22 @@ static void test_task(void *arg) {
   char *name = static_cast<char *>(arg);
   const char *label = test_label(name);
   const std::string self = name;
-  ESP_LOGI(TAG_UI, "[%s] ТЕСТ НАЧАТ: %s", clock_stamp().c_str(), label ? label : self.c_str());
+  evlog('i', "[%s] ТЕСТ НАЧАТ: %s", clock_stamp().c_str(), label ? label : self.c_str());
   if (self == "test_marker") {
-    ESP_LOGI(TAG_UI, "[%s] МАРКЕР: отметка для поиска момента в журнале", clock_stamp().c_str());
+    evlog('i', "[%s] МАРКЕР: отметка для поиска момента в журнале", clock_stamp().c_str());
     set_status("Маркер записан в журнал");
   } else if (self == "test_role") {
     std::string saved;
     const bool has_saved = netrole::saved_sta(saved);
-    ESP_LOGI(TAG_UI, "[%s] роль: %s", clock_stamp().c_str(), local_role().c_str());
-    ESP_LOGI(TAG_UI, "[%s] своя точка активна: %s; сохранённая сеть: %s; связь с соседом: %s",
+    evlog('i', "[%s] роль: %s", clock_stamp().c_str(), local_role().c_str());
+    evlog('i', "[%s] своя точка активна: %s; сохранённая сеть: %s; связь с соседом: %s",
              clock_stamp().c_str(), netrole::own_ap_active() ? "да" : "нет",
              has_saved ? saved.c_str() : "нет", peer_link_state ? "да" : "нет");
     set_status("Состояние роли записано в журнал");
   } else if (self == "test_scan") {
     uint8_t bssid[6] = {0};
     const bool found = netrole::find_bssid(setup_ssid, bssid);
-    ESP_LOGI(TAG_UI, "[%s] скан завершён: точка настройки %s", clock_stamp().c_str(),
+    evlog('i', "[%s] скан завершён: точка настройки %s", clock_stamp().c_str(),
              found ? "найдена" : "не найдена");
     set_status(found ? "Скан: точка настройки найдена" : "Скан: точка настройки не найдена");
   } else if (self == "test_peer") {
@@ -1570,18 +1679,18 @@ static void test_task(void *arg) {
       const std::string url = "http://" + host + "/peer_identity";
       const uint32_t t0 = now_ms();
       const bool ok = prov_link::get_request(url, resp, 2000);
-      ESP_LOGI(TAG_UI, "[%s] сосед %s: %s, %u байт, %lu мс", clock_stamp().c_str(), host.c_str(),
+      evlog('i', "[%s] сосед %s: %s, %u байт, %lu мс", clock_stamp().c_str(), host.c_str(),
                ok ? "ответил" : "не ответил", (unsigned) resp.size(),
                (unsigned long) (now_ms() - t0));
     }
     std::string known_ip;
-    ESP_LOGI(TAG_UI, "[%s] адрес соседа из проверки связи: %s; кэш домашней сети: %s; пропусков подряд: %d",
+    evlog('i', "[%s] адрес соседа из проверки связи: %s; кэш домашней сети: %s; пропусков подряд: %d",
              clock_stamp().c_str(), peer_ip_now(known_ip) ? known_ip.c_str() : "нет",
              home_peer_ip.empty() ? "пуст" : home_peer_ip.c_str(), peer_misses);
     set_status("Проверка соседа записана в журнал");
   } else if (self == "test_peer_data") {
     if (device_kind != "screen") {
-      ESP_LOGI(TAG_UI, "[%s] тест нужен только на экране", clock_stamp().c_str());
+      evlog('i', "[%s] тест нужен только на экране", clock_stamp().c_str());
       set_status("Тест выполняется на экране");
     } else {
       uint32_t age = 0;
@@ -1593,7 +1702,7 @@ static void test_task(void *arg) {
         age = now_ms() - peer_data_at;
         xSemaphoreGive(peer_status_lock);
       }
-      ESP_LOGI(TAG_UI, "[%s] данные весов: %s, %u байт, возраст %lu мс", clock_stamp().c_str(),
+      evlog('i', "[%s] данные весов: %s, %u байт, возраст %lu мс", clock_stamp().c_str(),
                have ? "есть" : "нет", (unsigned) size, (unsigned long) age);
       set_status(have && age < 10000 ? "Данные весов свежие" : "Данных весов нет или они устарели");
     }
@@ -1603,21 +1712,21 @@ static void test_task(void *arg) {
     std::string blob, back;
     const bool enc = prov::encrypt_text(prov_key.c_str(), plain, blob);
     const bool dec = enc && prov::decrypt_text(prov_key.c_str(), blob, back) && back == plain;
-    ESP_LOGI(TAG_UI, "[%s] экспорт: сеть=%s, калибровка=%s, блок %u байт, шифрование и расшифровка %s",
+    evlog('i', "[%s] экспорт: сеть=%s, калибровка=%s, блок %u байт, шифрование и расшифровка %s",
              clock_stamp().c_str(), net ? "да" : "нет", cal ? "да" : "нет", (unsigned) blob.size(),
              dec ? "успешны" : "НЕ ПРОШЛИ");
     set_status(dec ? "Экспорт: шифрование проверено" : "Экспорт: ошибка шифрования");
   } else if (self == "test_tiebreak") {
-    ESP_LOGI(TAG_UI, "[%s] сброс обоих: команда соседу и перезагрузка этого устройства", clock_stamp().c_str());
+    evlog('i', "[%s] сброс обоих: команда соседу и перезагрузка этого устройства", clock_stamp().c_str());
     const bool peer_ok = reset_peer_now();
-    ESP_LOGI(TAG_UI, "[%s] сосед %s", clock_stamp().c_str(),
+    evlog('i', "[%s] сосед %s", clock_stamp().c_str(),
              peer_ok ? "принял сброс" : "не ответил: сбрасывается только это устройство");
     mark_reset_pending();
     set_status("Сброс: перезагрузка для теста тай-брейка");
     vTaskDelay(pdMS_TO_TICKS(1000));
     if (on_reset) on_reset();  // перезагрузка; итог роли запишется после загрузки
   }
-  ESP_LOGI(TAG_UI, "[%s] ТЕСТ ЗАВЕРШЁН: %s", clock_stamp().c_str(), label ? label : self.c_str());
+  evlog('i', "[%s] ТЕСТ ЗАВЕРШЁН: %s", clock_stamp().c_str(), label ? label : self.c_str());
   free(name);
   test_busy = false;
   vTaskDelete(nullptr);
@@ -1628,7 +1737,7 @@ inline void tiebreak_check_task(void *) {
   vTaskDelay(pdMS_TO_TICKS(70000));
   std::string saved;
   const bool has_saved = netrole::saved_sta(saved);
-  ESP_LOGI(TAG_UI, "[%s] ТЕСТ ТАЙ-БРЕЙК, итог после сброса: роль=%s; своя точка активна=%s; сохранённая сеть=%s; связь с соседом=%s",
+  evlog('i', "[%s] ТЕСТ ТАЙ-БРЕЙК, итог после сброса: роль=%s; своя точка активна=%s; сохранённая сеть=%s; связь с соседом=%s",
            clock_stamp().c_str(), local_role().c_str(), netrole::own_ap_active() ? "да" : "нет",
            has_saved ? saved.c_str() : "нет", peer_link_state ? "да" : "нет");
   clear_reset_pending();
@@ -1662,7 +1771,7 @@ static esp_err_t h_test(httpd_req_t *req) {
 static esp_err_t h_reboot(httpd_req_t *req) {
   httpd_resp_set_type(req, "application/json; charset=utf-8");
   if (!on_reboot) return reply_msg(req, "Перезагрузка не поддерживается");
-  ESP_LOGW(TAG_UI, "reboot requested from web page");
+  evlog('w', "reboot requested from web page");
   set_status("Перезагрузка по команде со страницы");
   httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"Перезагрузка\"}");
   vTaskDelay(pdMS_TO_TICKS(250));
@@ -1683,7 +1792,7 @@ static esp_err_t h_time(httpd_req_t *req) {
   const std::string tz = form_value(b, "tz");
   if (!tz.empty()) clock_tz_min = (int) strtol(tz.c_str(), nullptr, 10);
   clock_set_at = ts;
-  ESP_LOGI(TAG_UI, "[%s] время задано со страницы", clock_stamp().c_str());
+  evlog('i', "[%s] время задано со страницы", clock_stamp().c_str());
   return reply_msg(req, "Время установлено");
 }
 
@@ -1727,7 +1836,7 @@ static esp_err_t h_prov(httpd_req_t *req) {
 inline void reg_uri(httpd_handle_t srv, const httpd_uri_t &u) {
   const esp_err_t err = httpd_register_uri_handler(srv, &u);
   if (err != ESP_OK) {
-    ESP_LOGE(TAG_UI, "register %s failed: %s", u.uri, esp_err_to_name(err));
+    evlog('e', "register %s failed: %s", u.uri, esp_err_to_name(err));
   }
 }
 
@@ -1742,7 +1851,7 @@ inline void start(int port) {
   cfg.stack_size = 12288;
   httpd_handle_t srv = nullptr;
   if (httpd_start(&srv, &cfg) != ESP_OK) {
-    ESP_LOGE(TAG_UI, "httpd start failed on port %d", port);
+    evlog('e', "httpd start failed on port %d", port);
     return;
   }
 
@@ -1763,7 +1872,7 @@ inline void start(int port) {
     xTaskCreate(peer_monitor_task, "peer_monitor", 8192, nullptr, 1, nullptr);
     if (device_kind == "screen") xTaskCreate(peer_data_task, "peer_data", 6144, nullptr, 1, nullptr);
   } else {
-    ESP_LOGE(TAG_UI, "cannot create peer status mutex");
+    evlog('e', "cannot create peer status mutex");
   }
 
   u = {};
@@ -1811,6 +1920,9 @@ inline void start(int port) {
   u.uri = "/test"; u.method = HTTP_POST; u.handler = h_test;
   reg_uri(srv, u);
 
+  u = {};
+  u.uri = "/events"; u.method = HTTP_GET; u.handler = h_events;
+  reg_uri(srv, u);
   u = {};
   u.uri = "/peer_cmd"; u.method = HTTP_POST; u.handler = h_peer_cmd;
   reg_uri(srv, u);

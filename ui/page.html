@@ -32,7 +32,10 @@
   --base:#090c17;--b1:#1c3d8c;--b2:#552d8e;--b3:#0e5a64;
 }}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html{-webkit-text-size-adjust:100%;overflow-y:scroll;scrollbar-gutter:stable}
+html{-webkit-text-size-adjust:100%}
+@media (hover:hover) and (pointer:fine){html{overflow-y:scroll}}
+::-webkit-scrollbar{width:0;height:0;background:transparent}
+html{scrollbar-width:none}
 body{margin:0;min-height:100vh;color:var(--text);-webkit-font-smoothing:antialiased;
   font:16px/1.4 -apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","Helvetica Neue",system-ui,"Segoe UI",Roboto,sans-serif;
   background:var(--base)}
@@ -45,6 +48,7 @@ main{max-width:640px;margin:0 auto;padding:calc(20px + env(safe-area-inset-top))
 .glass::before{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;opacity:var(--sheen);
   background:linear-gradient(145deg,rgba(255,255,255,.4),rgba(255,255,255,0) 40%)}
 .glass>*{position:relative}
+@media (max-width:700px){.glass{-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px)}.glass::before{display:none}}
 @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){.glass{background:var(--glass2)}}
 
 .top{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:4px 4px 20px}
@@ -80,7 +84,7 @@ h2{margin:24px 8px 10px;font-size:13px;font-weight:600;letter-spacing:.06em;text
 .btn{appearance:none;font:inherit;font-weight:600;font-size:17px;min-height:52px;padding:0 20px;width:100%;cursor:pointer;
   display:flex;align-items:center;justify-content:center;gap:9px;color:var(--text);
   background:var(--field);border:1px solid var(--stroke);border-radius:17px;
-  -webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);transition:transform .12s,opacity .2s}
+  transition:transform .12s,opacity .2s}
 .btn:active{transform:scale(.975)}
 .btn:disabled{opacity:.45;pointer-events:none}
 .btn.pri{color:#fff;background:linear-gradient(180deg,#4aa3ff,#0a7aff);border-color:rgba(255,255,255,.38);box-shadow:0 8px 20px rgba(10,122,255,.34),inset 0 1px 0 rgba(255,255,255,.4)}
@@ -108,6 +112,8 @@ h2{margin:24px 8px 10px;font-size:13px;font-weight:600;letter-spacing:.06em;text
 .empty{padding:22px 18px;text-align:center;color:var(--text2)}
 .ev{display:flex;gap:14px;padding:11px 0;border-bottom:1px solid var(--sep);font-size:14px}
 .ev:last-child{border-bottom:0}
+.ev.e span{color:var(--red)}
+.ev.w span{color:var(--orange)}
 .ev time{color:var(--text3);font-variant-numeric:tabular-nums;flex:none}
 .back{appearance:none;border:0;background:none;color:var(--blue);font:inherit;font-weight:600;font-size:17px;padding:6px 8px;margin:-6px 0 8px -8px;cursor:pointer}
 .net .v{color:var(--text2);font-size:15px;flex:none}
@@ -367,20 +373,32 @@ let S={},W=null,offline=0,isScale=false,busy=false,pend='',askRes=null,cur=null,
 const events=[];
 
 /* ---------- сообщения ---------- */
-function logEv(t){
-  if(!t||(events[0]&&events[0].t===t))return;
-  events.unshift({t:t,at:new Date()});if(events.length>30)events.pop();renderEv();
+function logEv(t,l,at){
+  if(!t||(!at&&events[0]&&events[0].t===t&&events[0].l===(l||'i')))return;
+  events.unshift({t:t,l:l||'i',at:at||new Date()});if(events.length>60)events.pop();renderEv();
+}
+let lastEv=0;
+async function pullEvents(){
+  const j=await api('/events?after='+lastEv);
+  if(j.last<lastEv)lastEv=0;            // устройство перезагрузилось: нумерация началась заново
+  (j.ev||[]).forEach(e=>{
+    if(e.i<=lastEv)return;
+    lastEv=e.i;
+    const at=e.t?new Date(e.t*1000):new Date();
+    logEv(e.m,e.l,at);
+  });
 }
 function renderEv(){
   const b=$('events');clear(b);
   if(!events.length){b.append(el('div','empty','Пока нет событий'));return}
-  events.forEach(e=>{const r=el('div','ev');r.append(el('time',null,e.at.toLocaleTimeString('ru-RU')),el('span',null,e.t));b.append(r)});
+  events.forEach(e=>{const r=el('div','ev'+(e.l==='e'?' e':e.l==='w'?' w':''));r.append(el('time',null,e.at.toLocaleTimeString('ru-RU')),el('span',null,e.t));b.append(r)});
 }
 function say(t,keep){
   const s=$('toast');clearTimeout(tt);
   if(!t){s.classList.remove('on');return}
-  s.textContent=t;s.classList.add('on');logEv(t);
-  if(!keep)tt=setTimeout(()=>s.classList.remove('on'),7000);
+  s.textContent=t;s.classList.add('on');
+  if(!/^Команда принята/.test(t))logEv(t,/Нет связи|Ошибка|Не удалось|не ответ|не найден|не на связи|повреждена|не подходит|слишком большой/i.test(t)?'e':'i');
+  tt=setTimeout(()=>s.classList.remove('on'),keep?6500:2800);
 }
 $('toast').onclick=()=>say('');
 
@@ -473,11 +491,10 @@ function render(j){
   // калибровка
   vis('cal-note',!W);
   if(W)renderCurve(W.curve);else renderCurve('');
-  if(j.status&&j.status!==lastSt){lastSt=j.status;if(j.status!=='Ожидание')logEv(j.status)}
 }
 async function refresh(){
   if(document.hidden)return;
-  try{S=await api('/status');offline=0;render(S);syncClock(S)}
+  try{S=await api('/status');offline=0;render(S);syncClock(S);pullEvents().catch(()=>{})}
   catch(e){if(++offline>=2){chip('bad','Нет связи со страницей')}}
 }
 
