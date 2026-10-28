@@ -71,4 +71,18 @@ jobs:
         run: esphome config ${{ matrix.config }} > /dev/null
 
       - name: Сборка
-        run: esphome compile ${{ matrix.config }}
+        shell: bash
+        run: |
+          set +e
+          esphome compile ${{ matrix.config }} 2>&1 | tee build.log
+          code=${PIPESTATUS[0]}
+          # Короткая выдержка попадает в аннотации запуска: читается без скачивания полного журнала
+          esc() { sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}'; }
+          if [ "$code" -ne 0 ]; then
+            msg=$(grep -nE "error|Error|FAILED|undefined reference" build.log | head -40 | esc)
+            echo "::error title=Сборка ${{ matrix.config }} не удалась::${msg}"
+          else
+            msg=$(grep -E "RAM:|Flash:" build.log | tail -3 | esc)
+            echo "::notice title=Размер ${{ matrix.config }}::${msg}"
+          fi
+          exit "$code"
