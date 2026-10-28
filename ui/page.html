@@ -355,6 +355,46 @@ h2{margin:24px 8px 10px;font-size:13px;font-weight:600;letter-spacing:.06em;text
 </div>
 
 <script>
+/* Отладка по адресу #debug: показывает, перезагружается ли страница при переключении вкладок */
+(function(){
+  var ss=window.sessionStorage,on=false;
+  try{on=/debug/.test(location.hash)||ss.getItem('dbg')==='1';if(on)ss.setItem('dbg','1')}catch(e){}
+  if(!on)return;
+  var now=function(){return Math.round(performance.now())};
+  var loads=0,hc=0,reqs={},inflight=0,logs=[];
+  try{loads=(+ss.getItem('dbg_loads')||0)+1;ss.setItem('dbg_loads',loads);logs=JSON.parse(ss.getItem('dbg_log')||'[]')}catch(e){loads=1}
+  function log(t){logs.push(new Date().toLocaleTimeString('ru-RU')+' +'+now()+'мс '+t);if(logs.length>40)logs.shift();try{ss.setItem('dbg_log',JSON.stringify(logs))}catch(e){}}
+  log('ЗАГРУЗКА страницы №'+loads);
+  addEventListener('beforeunload',function(){log('beforeunload: страница выгружается')});
+  addEventListener('pagehide',function(e){log('pagehide persisted='+e.persisted)});
+  addEventListener('pageshow',function(e){log('pageshow persisted='+e.persisted)});
+  addEventListener('hashchange',function(){hc++;log('hashchange '+location.hash)});
+  document.addEventListener('visibilitychange',function(){log('visibility '+document.visibilityState)});
+  document.addEventListener('click',function(e){var t=e.target.closest&&e.target.closest('.tab');if(t)log('нажата вкладка '+t.dataset.p)},true);
+  var of=window.fetch;
+  window.fetch=function(u){var k=String(u).split('?')[0],t=now();inflight++;reqs[k]=(reqs[k]||0)+1;
+    return of.apply(this,arguments).then(function(r){inflight--;var d=now()-t;if(d>800||k!=='/status')log('fetch '+k+' '+d+'мс');return r},function(e){inflight--;log('fetch '+k+' ОШИБКА');throw e})};
+  function init(){
+    var box=document.createElement('div');
+    box.style.cssText='position:fixed;left:6px;right:6px;top:6px;z-index:2147483000;padding:8px 10px;border-radius:10px;background:rgba(0,0,0,.82);color:#fff;font:11px/1.35 ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-all;max-height:46vh;overflow:auto';
+    var pre=document.createElement('div'),x=document.createElement('button');
+    x.textContent='Закрыть отладку';x.style.cssText='display:block;margin:6px 0 0;padding:6px 10px;font:inherit';
+    x.onclick=function(){try{ss.removeItem('dbg');ss.removeItem('dbg_loads');ss.removeItem('dbg_log')}catch(e){}box.remove()};
+    box.append(pre,x);document.body.append(box);
+    function paint(){
+      var nav=(performance.getEntriesByType&&performance.getEntriesByType('navigation')[0])||{};
+      var res=performance.getEntriesByType?performance.getEntriesByType('resource'):[];
+      pre.textContent='ОТЛАДКА\nзагрузок страницы за сессию: '+loads+'\nвозраст страницы: '+(performance.now()/1000).toFixed(1)+' с\nтип загрузки: '+(nav.type||'?')+'\nсмен адреса #: '+hc+
+        '\nзапросов: '+Object.keys(reqs).map(function(k){return k+'×'+reqs[k]}).join(', ')+' (в полёте '+inflight+')'+
+        '\nресурсов страницы: '+res.length+(res.length?' (последний: '+res[res.length-1].name.replace(location.origin,'')+')':'')+
+        '\nготовность: '+document.readyState+'\n--- журнал ---\n'+logs.slice(-12).join('\n');
+    }
+    paint();setInterval(paint,700);
+  }
+  if(document.body)init();else document.addEventListener('DOMContentLoaded',init);
+})();
+</script>
+<script>
 const $=id=>document.getElementById(id);
 const el=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e};
 const clear=e=>{e.textContent=''};
