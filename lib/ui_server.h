@@ -4,9 +4,11 @@
 // Заменяет встроенный web_server ESPHome. Черновик, не проверен на железе.
 
 #include <string>
+#include <vector>
 #include <functional>
 #include <cmath>
 #include <string.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/time.h>
@@ -74,6 +76,12 @@ struct PeerCandidateCache {
   bool valid = false;
 };
 inline PeerCandidateCache peer_candidate_cache[ESP_WIFI_MAX_CONN_NUM] = {};
+// Адрес соседа, найденный проверкой связи (пишет только peer_monitor_task, читает под peer_status_lock)
+inline char peer_ip_buf[16] = "";
+inline std::string home_peer_ip;           // последний рабочий адрес соседа в домашней сети
+inline std::string peer_data;              // последний ответ /status соседа (только экран)
+inline uint32_t peer_data_at = 0;          // когда получен, мс
+inline int peer_misses = 0;                // подряд пропущенных проверок связи
 
 // ---- устройство ----
 inline std::string device_kind = "screen";        // "screen" или "scale"
@@ -84,6 +92,9 @@ inline std::function<std::string()> extra_status;
 inline std::function<std::string()> on_zero;
 inline std::function<std::string(float)> on_calib;
 inline std::function<std::string()> on_curve_reset;
+// Калибровка для экспорта/импорта: текст "ноль,кг1,отсч1,…,кг5,отсч5". Задаются только на весах.
+inline std::function<std::string()> export_cal;
+inline std::function<std::string(const std::string &)> import_cal;
 
 inline uint32_t now_ms() { return (uint32_t) (esp_timer_get_time() / 1000); }
 
@@ -92,12 +103,64 @@ inline void close_window() { window_until = 0; }
 inline bool window_open() {
   return window_until != 0 && (int32_t) (now_ms() - window_until) < 0;
 }
-inline void set_status(const std::string &s) { snprintf(status_buf, sizeof(status_buf), "%s", s.c_str()); }
+// ---- Журнал событий для раздела «События» на странице ----
+// Кольцо из 24 записей; страница забирает новые по GET /events?after=<id>.
+// Сюда попадают смена статуса, результаты тестов, ошибки и смена связи с соседом.
+struct UiEvent {
+  uint32_t id;
+  long long ts;     // Unix-время, если часы заданы страницей, иначе 0
+  uint32_t up_s;    // секунд с запуска
+  char lvl;         // 'i' информация, 'w' предупреждение, 'e' ошибка
+  char text[140];
+};
+inline constexpr int kEvCount = 24;
+inline UiEvent ev_ring[kEvCount] = {};
+inline uint32_t ev_last_id = 0;
+inline SemaphoreHandle_t ev_lock = nullptr;
+
+inline void add_event(char lvl, const char *text) {
+  if (ev_lock == nullptr) ev_lock = xSemaphoreCreateMutex();
+  if (ev_lock == nullptr || xSemaphoreTake(ev_lock, pdMS_TO_TICKS(50)) != pdTRUE) return;
+  const UiEvent &prev = ev_ring[(ev_last_id + kEvCount - 1) % kEvCount];
+  if (!(ev_last_id > 0 && prev.lvl == lvl && strncmp(prev.text, text, sizeof(prev.text) - 1) == 0)) {
+    UiEvent &e = ev_ring[ev_last_id % kEvCount];
+    e.id = ++ev_last_id;
+    e.ts = clock_set_at ? (long long) time(nullptr) : 0;
+    e.up_s = (uint32_t) (esp_timer_get_time() / 1000000);
+    e.lvl = lvl;
+    snprintf(e.text, sizeof(e.text), "%s", text);
+  }
+  xSemaphoreGive(ev_lock);
+}
+
+// Пишет и в журнал устройства, и в «События». Формат как у printf; префикс "[время] " в событие не попадает.
+inline void evlog(char lvl, const char *fmt, ...) {
+  char buf[200];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (lvl == 'e') ESP_LOGE(TAG_UI, "%s", buf);
+  else if (lvl == 'w') ESP_LOGW(TAG_UI, "%s", buf);
+  else ESP_LOGI(TAG_UI, "%s", buf);
+  const char *t = buf;
+  if (buf[0] == '[') {
+    const char *c = strstr(buf, "] ");
+    if (c != nullptr) t = c + 2;
+  }
+  add_event(lvl, t);
+}
+
+inline void set_status(const std::string &s) {
+  if (s != status_buf && s != "Ожидание") add_event('i', s.c_str());
+  snprintf(status_buf, sizeof(status_buf), "%s", s.c_str());
+}
 
 // Команды калибровки: httpd только ставит в очередь, выполняет цикл ESPHome (run_pending)
 inline volatile bool cmd_pending = false;
 inline std::string cmd_name;
 inline float cmd_known = 0.0f;
+inline std::string cmd_text;
 
 inline void run_test(const std::string &name);  // определена ниже, рядом с тестами страницы
 
@@ -112,6 +175,7 @@ inline void run_pending() {
   if (cmd_name == "zero" && on_zero) r = on_zero();
   else if (cmd_name == "calib" && on_calib) r = on_calib(cmd_known);
   else if (cmd_name == "curve_reset" && on_curve_reset) r = on_curve_reset();
+  else if (cmd_name == "import_cal" && import_cal) r = import_cal(cmd_text);
   if (!r.empty()) set_status(r);
 }
 
@@ -151,10 +215,14 @@ static const char PAGE[] = R"HTML(
 }}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html{-webkit-text-size-adjust:100%}
+@media (hover:hover) and (pointer:fine){html{overflow-y:scroll}}
+::-webkit-scrollbar{width:0;height:0;background:transparent}
+html{scrollbar-width:none}
 body{margin:0;min-height:100vh;color:var(--text);-webkit-font-smoothing:antialiased;
 font:16px/1.4 -apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","Helvetica Neue",system-ui,"Segoe UI",Roboto,sans-serif;
-background:radial-gradient(70vmax 70vmax at 0% 0%,var(--b1),transparent 62%),radial-gradient(60vmax 60vmax at 100% 28%,var(--b2),transparent 62%),radial-gradient(70vmax 70vmax at 20% 100%,var(--b3),transparent 62%),var(--base);
-background-attachment:fixed}
+background:var(--base)}
+body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;background:radial-gradient(70vmax 70vmax at 0% 0%,var(--b1),transparent 62%),radial-gradient(60vmax 60vmax at 100% 28%,var(--b2),transparent 62%),radial-gradient(70vmax 70vmax at 20% 100%,var(--b3),transparent 62%),var(--base);
+}
 main{max-width:640px;margin:0 auto;padding:calc(20px + env(safe-area-inset-top)) 16px calc(120px + env(safe-area-inset-bottom))}
 .glass{position:relative;background:var(--glass);border:1px solid var(--stroke);border-radius:26px;
 box-shadow:var(--shadow),inset 0 1px 0 var(--stroke),inset 0 0 0 1px var(--stroke-in);
@@ -162,6 +230,7 @@ box-shadow:var(--shadow),inset 0 1px 0 var(--stroke),inset 0 0 0 1px var(--strok
 .glass::before{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;opacity:var(--sheen);
 background:linear-gradient(145deg,rgba(255,255,255,.4),rgba(255,255,255,0) 40%)}
 .glass>*{position:relative}
+@media (max-width:700px){.glass{-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px)}.glass::before{display:none}}
 @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){.glass{background:var(--glass2)}}
 .top{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:4px 4px 20px}
 h1{margin:0;font-size:34px;line-height:1.1;font-weight:700;letter-spacing:-.02em}
@@ -174,8 +243,7 @@ h2{margin:24px 8px 10px;font-size:13px;font-weight:600;letter-spacing:.06em;text
 .chip.wait .dot{background:var(--orange);animation:pulse 1.2s ease-in-out infinite}
 @keyframes pulse{50%{opacity:.3}}
 .page{display:none}
-.page.on{display:block;animation:in .32s ease}
-@keyframes in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+.page.on{display:block}
 .card{padding:18px;margin-bottom:14px}
 .hero{padding:28px 22px;text-align:center;margin-bottom:14px}
 .lab{font-size:12px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--text2)}
@@ -195,7 +263,7 @@ h2{margin:24px 8px 10px;font-size:13px;font-weight:600;letter-spacing:.06em;text
 .btn{appearance:none;font:inherit;font-weight:600;font-size:17px;min-height:52px;padding:0 20px;width:100%;cursor:pointer;
 display:flex;align-items:center;justify-content:center;gap:9px;color:var(--text);
 background:var(--field);border:1px solid var(--stroke);border-radius:17px;
--webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);transition:transform .12s,opacity .2s}
+transition:transform .12s,opacity .2s}
 .btn:active{transform:scale(.975)}
 .btn:disabled{opacity:.45;pointer-events:none}
 .btn.pri{color:#fff;background:linear-gradient(180deg,#4aa3ff,#0a7aff);border-color:rgba(255,255,255,.38);box-shadow:0 8px 20px rgba(10,122,255,.34),inset 0 1px 0 rgba(255,255,255,.4)}
@@ -222,7 +290,14 @@ background:var(--field);border:1px solid var(--stroke);border-radius:17px;
 .empty{padding:22px 18px;text-align:center;color:var(--text2)}
 .ev{display:flex;gap:14px;padding:11px 0;border-bottom:1px solid var(--sep);font-size:14px}
 .ev:last-child{border-bottom:0}
+.ev.e span{color:var(--red)}
+.ev.w span{color:var(--orange)}
 .ev time{color:var(--text3);font-variant-numeric:tabular-nums;flex:none}
+.back{appearance:none;border:0;background:none;color:var(--blue);font:inherit;font-weight:600;font-size:17px;padding:6px 8px;margin:-6px 0 8px -8px;cursor:pointer}
+.net .v{color:var(--text2);font-size:15px;flex:none}
+.ta{width:100%;min-height:104px;padding:12px 14px;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--text);background:var(--field);border:1px solid var(--stroke);border-radius:17px;outline:0;resize:vertical;word-break:break-all}
+.ta:focus{border-color:var(--blue);box-shadow:0 0 0 4px rgba(10,122,255,.22)}
+.note{margin:0 0 12px;padding:12px 14px;border-radius:14px;background:var(--field);border:1px solid var(--stroke);font-size:14px;color:var(--text2)}
 .foot{text-align:center;color:var(--text3);font-size:13px;margin:22px 0 0}
 .tabs{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(14px + env(safe-area-inset-bottom));z-index:20;
 display:flex;gap:4px;padding:6px;border-radius:32px;width:min(calc(100% - 28px),470px);background:var(--tabs)}
@@ -252,6 +327,7 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M2.6 9.2a14 14 0 0 1 18.8 0M5.7 12.6a9.6 9.6 0 0 1 12.6 0M8.8 16a5.2 5.2 0 0 1 6.4 0"/><circle cx="12" cy="19.3" r="1" fill="currentColor"/></symbol>
 <symbol id="i-cal" viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="16" rx="4.5"/><path d="M7.8 11.2a4.5 4.5 0 0 1 8.4 0M12 11.4l2-2.6"/></symbol>
 <symbol id="i-sys" viewBox="0 0 24 24"><path d="M4 6.5h8M17 6.5h3M4 12h3M12 12h8M4 17.5h9M18 17.5h2"/><circle cx="14.5" cy="6.5" r="2.3"/><circle cx="9.5" cy="12" r="2.3"/><circle cx="15.5" cy="17.5" r="2.3"/></symbol>
+<symbol id="i-chev" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
 <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="9.5" rx="2.6"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/></symbol>
 <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></symbol>
 <symbol id="i-search" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.4-5.7M20 4v4.6h-4.6"/></symbol>
@@ -262,22 +338,19 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <span class="chip glass" id="chip"><i class="dot"></i><span id="chiptxt">Загрузка</span></span>
 </header>
 <section class="page on" id="p-home">
-<div class="glass hero" id="hero-scale" hidden>
+<div class="glass hero" id="hero-w" hidden>
 <div class="lab">Вес сейчас</div>
 <div class="big"><span id="live">—</span><small>кг</small></div>
 <div class="hint">Последний результат: <b id="res">нет данных</b></div>
 </div>
-<div class="glass hero" id="hero-screen" hidden>
-<div class="lab">Связь</div>
-<div class="mid" id="hs-main">Проверяем…</div>
-<div class="hint" id="hs-sub"></div>
+<div class="glass hero" id="hero-off" hidden>
+<div class="lab">Весы</div>
+<div class="mid" id="ho-main">Проверяем…</div>
+<div class="hint" id="ho-sub"></div>
 </div>
 <div class="grid">
-<div class="glass tile"><div class="lab">Сеть</div><div class="v" id="h-net">—</div></div>
-<div class="glass tile"><div class="lab">Сигнал</div><div class="v"><span id="h-bars"></span><span id="h-sig">—</span></div></div>
-<div class="glass tile"><div class="lab">IP-адрес</div><div class="v" id="h-ip">—</div></div>
-<div class="glass tile"><div class="lab">Режим пары</div><div class="v" id="h-role">—</div></div>
-<div class="glass tile wide"><div class="lab">Статус</div><div class="v" id="h-st">—</div></div>
+<div class="glass tile"><div class="lab" id="h-peer-lab">Связь</div><div class="v" id="h-peer">—</div></div>
+<div class="glass tile"><div class="lab">Калибровка</div><div class="v" id="h-cal">—</div></div>
 </div>
 </section>
 <section class="page" id="p-net">
@@ -285,6 +358,9 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <div class="row"><span class="k">Сеть</span><span class="v" id="n-net">—</span></div>
 <div class="row"><span class="k">IP-адрес</span><span class="v" id="n-ip">—</span></div>
 <div class="row"><span class="k">Сигнал</span><span class="v"><span id="n-bars"></span><span id="n-sig">—</span></span></div>
+<div class="row"><span class="k">Режим пары</span><span class="v" id="n-role">—</span></div>
+<div class="row"><span class="k">Второе устройство</span><span class="v" id="n-peer">—</span></div>
+<div class="row"><span class="k">Статус</span><span class="v" id="n-st">—</span></div>
 </div>
 <h2>Окно настройки</h2>
 <div class="glass card">
@@ -295,7 +371,41 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <button class="btn pri" id="b-scan"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#i-search"/></svg><span>Искать сети</span></button>
 <div class="glass list" id="list" style="margin-top:14px;padding:0" hidden></div>
 </section>
+<section class="page" id="p-sys">
+<div class="glass list">
+<div class="row"><span class="k">Устройство</span><span class="v" id="s-dev">—</span></div>
+<div class="row"><span class="k">Время устройства</span><span class="v" id="s-clock">—</span></div>
+</div>
+<h2>Разделы</h2>
+<div class="glass list" style="padding:0">
+<button class="net" type="button" data-go="cal"><b>Калибровка</b><span class="v" id="l-cal"></span><svg viewBox="0 0 24 24"><use href="#i-chev"/></svg></button>
+<button class="net" type="button" data-go="cfg"><b>Настройки: экспорт и импорт</b><svg viewBox="0 0 24 24"><use href="#i-chev"/></svg></button>
+<button class="net" type="button" data-go="tests"><b>Тесты</b><svg viewBox="0 0 24 24"><use href="#i-chev"/></svg></button>
+</div>
+<div id="install">
+<h2>На экран телефона</h2>
+<div class="glass card">
+<p class="hint" style="margin:0 0 10px" id="inst-text"></p>
+<p class="hint" style="margin:0">Адрес этого устройства в сети настройки и в домашней сети разный, поэтому ярлык нужно добавить отдельно в каждой, когда вы туда попадёте.</p>
+</div>
+</div>
+<h2>Сброс сети</h2>
+<div class="glass card">
+<p class="hint" style="margin:0 0 14px">Сбрасывает Wi-Fi на обоих устройствах, если второе отвечает. Оба перезагрузятся и заново найдут друг друга.</p>
+<button class="btn dng" id="b-reset">Сбросить сеть</button>
+</div>
+<h2>Перезагрузка</h2>
+<div class="glass card">
+<p class="hint" style="margin:0 0 14px">Перезагружает только это устройство. Сосед не затрагивается, сеть сохраняется.</p>
+<button class="btn" id="b-reboot">Перезагрузить</button>
+</div>
+<h2>События</h2>
+<div class="glass list" id="events"></div>
+<p class="foot">Floor Scale · веб-интерфейс устройства</p>
+</section>
 <section class="page" id="p-cal">
+<button class="back" type="button" data-go="sys">‹ Система</button>
+<div class="note" id="cal-note" hidden>Весы не на связи: калибровка недоступна.</div>
 <div class="glass hero">
 <div class="lab">Вес сейчас</div>
 <div class="big"><span id="c-live">—</span><small>кг</small></div>
@@ -319,7 +429,31 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <button class="btn dng" id="b-curve">Сбросить точки</button>
 </div>
 </section>
+<section class="page" id="p-cfg">
+<button class="back" type="button" data-go="sys">‹ Система</button>
+<h2 style="margin-top:6px">Экспорт</h2>
+<div class="glass card">
+<p class="hint" style="margin:0 0 14px">Файл содержит сохранённую домашнюю сеть и калибровку весов. Пароль Wi-Fi в нём зашифрован ключом устройств: открыть файл можно только на устройствах этой пары.</p>
+<button class="btn pri" id="b-export">Скачать файл настроек</button>
+<div id="x-box" hidden style="margin-top:14px">
+<p class="hint" id="x-info" style="margin:0 0 8px"></p>
+<textarea class="ta" id="x-out" readonly aria-label="Содержимое файла настроек"></textarea>
+<button class="btn" id="b-copy" style="margin-top:10px">Скопировать текст</button>
+</div>
+</div>
+<h2>Импорт</h2>
+<div class="glass card">
+<p class="hint" style="margin:0 0 14px">Выберите файл настроек или вставьте его содержимое. Настройки применятся к этому и ко второму устройству. Если сеть изменится, устройства перезагрузятся.</p>
+<input id="f-in" type="file" accept=".json,.txt,application/json,text/plain" hidden>
+<div class="stack">
+<button class="btn" id="b-file">Выбрать файл…</button>
+<textarea class="ta" id="i-in" placeholder="Или вставьте содержимое файла сюда" aria-label="Содержимое файла настроек для импорта"></textarea>
+<button class="btn dng" id="b-import">Импортировать</button>
+</div>
+</div>
+</section>
 <section class="page" id="p-tests">
+<button class="back" type="button" data-go="sys">‹ Система</button>
 <p class="hint" style="margin:0 0 14px">Каждый тест пишет начало и конец в журнал устройства. Время в строках — внутреннее время устройства, если оно синхронизировано со страницей, иначе — время с запуска.</p>
 <div class="glass card">
 <h3 style="margin:0 0 6px">Маркер в журнал</h3>
@@ -343,46 +477,25 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 </div>
 <div class="glass card">
 <h3 style="margin:0 0 6px">Проверка соседа</h3>
-<p class="hint" style="margin:0 0 12px">Запрос к соседу по адресу точки и по имени. Пишет ответ и время ответа.</p>
+<p class="hint" style="margin:0 0 12px">Запрос к соседу по адресу точки и по имени. Пишет ответ, время ответа, запомненный адрес соседа и число пропущенных проверок связи подряд.</p>
 <button class="btn" data-test="peer">Проверить соседа</button>
 </div>
-</section>
-<section class="page" id="p-sys">
-<div class="glass list">
-<div class="row"><span class="k">Устройство</span><span class="v" id="s-dev">—</span></div>
-<div class="row"><span class="k">Режим пары</span><span class="v" id="s-role">—</span></div>
-<div class="row"><span class="k">Второе устройство</span><span class="v" id="s-peer">—</span></div>
-<div class="row"><span class="k">Окно настройки</span><span class="v" id="s-win">—</span></div>
-<div class="row"><span class="k">Время устройства</span><span class="v" id="s-clock">—</span></div>
+<div class="glass card" id="tc-pd" hidden>
+<h3 style="margin:0 0 6px">Данные весов на экране</h3>
+<p class="hint" style="margin:0 0 12px">Пишет, получены ли от весов вес и калибровка, размер ответа и его возраст. Данные считаются свежими, если им меньше 10 с.</p>
+<button class="btn" data-test="peer_data">Проверить данные весов</button>
 </div>
-<div id="install">
-<h2>На экран телефона</h2>
 <div class="glass card">
-<p class="hint" style="margin:0 0 10px" id="inst-text"></p>
-<p class="hint" style="margin:0">Адрес этого устройства в сети настройки и в домашней сети разный, поэтому ярлык нужно добавить отдельно в каждой, когда вы туда попадёте.</p>
+<h3 style="margin:0 0 6px">Экспорт настроек</h3>
+<p class="hint" style="margin:0 0 12px">Собирает файл настроек в памяти, шифрует и расшифровывает его и пишет в журнал, что в нём есть (сеть, калибровка) и размер. Пароли в журнал не пишутся.</p>
+<button class="btn" data-test="export">Проверить экспорт</button>
 </div>
-</div>
-<h2>Сброс сети</h2>
-<div class="glass card">
-<p class="hint" style="margin:0 0 14px">Сбрасывает Wi-Fi на обоих устройствах, если второе отвечает. Оба перезагрузятся и заново найдут друг друга.</p>
-<button class="btn dng" id="b-reset">Сбросить сеть</button>
-</div>
-<h2>Перезагрузка</h2>
-<div class="glass card">
-<p class="hint" style="margin:0 0 14px">Перезагружает только это устройство. Сосед не затрагивается, сеть сохраняется.</p>
-<button class="btn" id="b-reboot">Перезагрузить</button>
-</div>
-<h2>События</h2>
-<div class="glass list" id="events"></div>
-<p class="foot">Floor Scale · веб-интерфейс устройства</p>
 </section>
 </main>
 <nav class="tabs glass" role="tablist" aria-label="Разделы">
 <button class="tab" role="tab" id="t-home" data-p="home" aria-selected="true"><svg viewBox="0 0 24 24"><use href="#i-home"/></svg>Главная</button>
 <button class="tab" role="tab" id="t-net" data-p="net" aria-selected="false"><svg viewBox="0 0 24 24"><use href="#i-wifi"/></svg>Сеть</button>
-<button class="tab" role="tab" id="t-cal" data-p="cal" aria-selected="false" style="display:none"><svg viewBox="0 0 24 24"><use href="#i-cal"/></svg>Калибровка</button>
 <button class="tab" role="tab" id="t-sys" data-p="sys" aria-selected="false"><svg viewBox="0 0 24 24"><use href="#i-sys"/></svg>Система</button>
-<button class="tab" role="tab" id="t-tests" data-p="tests" aria-selected="false"><svg viewBox="0 0 24 24"><use href="#i-check"/></svg>Тесты</button>
 </nav>
 <div class="toast glass" id="toast" role="status" aria-live="polite"></div>
 <div class="scrim" id="scrim">
@@ -407,6 +520,46 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 </div>
 </div>
 <script>
+/* Отладка по адресу #debug: показывает, перезагружается ли страница при переключении вкладок */
+(function(){
+var ss=window.sessionStorage,on=false;
+try{on=/debug/.test(location.hash)||ss.getItem('dbg')==='1';if(on)ss.setItem('dbg','1')}catch(e){}
+if(!on)return;
+var now=function(){return Math.round(performance.now())};
+var loads=0,hc=0,reqs={},inflight=0,logs=[];
+try{loads=(+ss.getItem('dbg_loads')||0)+1;ss.setItem('dbg_loads',loads);logs=JSON.parse(ss.getItem('dbg_log')||'[]')}catch(e){loads=1}
+function log(t){logs.push(new Date().toLocaleTimeString('ru-RU')+' +'+now()+'мс '+t);if(logs.length>40)logs.shift();try{ss.setItem('dbg_log',JSON.stringify(logs))}catch(e){}}
+log('ЗАГРУЗКА страницы №'+loads);
+addEventListener('beforeunload',function(){log('beforeunload: страница выгружается')});
+addEventListener('pagehide',function(e){log('pagehide persisted='+e.persisted)});
+addEventListener('pageshow',function(e){log('pageshow persisted='+e.persisted)});
+addEventListener('hashchange',function(){hc++;log('hashchange '+location.hash)});
+document.addEventListener('visibilitychange',function(){log('visibility '+document.visibilityState)});
+document.addEventListener('click',function(e){var t=e.target.closest&&e.target.closest('.tab');if(t)log('нажата вкладка '+t.dataset.p)},true);
+var of=window.fetch;
+window.fetch=function(u){var k=String(u).split('?')[0],t=now();inflight++;reqs[k]=(reqs[k]||0)+1;
+return of.apply(this,arguments).then(function(r){inflight--;var d=now()-t;if(d>800||k!=='/status')log('fetch '+k+' '+d+'мс');return r},function(e){inflight--;log('fetch '+k+' ОШИБКА');throw e})};
+function init(){
+var box=document.createElement('div');
+box.style.cssText='position:fixed;left:6px;right:6px;top:6px;z-index:2147483000;padding:8px 10px;border-radius:10px;background:rgba(0,0,0,.82);color:#fff;font:11px/1.35 ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-all;max-height:46vh;overflow:auto';
+var pre=document.createElement('div'),x=document.createElement('button');
+x.textContent='Закрыть отладку';x.style.cssText='display:block;margin:6px 0 0;padding:6px 10px;font:inherit';
+x.onclick=function(){try{ss.removeItem('dbg');ss.removeItem('dbg_loads');ss.removeItem('dbg_log')}catch(e){}box.remove()};
+box.append(pre,x);document.body.append(box);
+function paint(){
+var nav=(performance.getEntriesByType&&performance.getEntriesByType('navigation')[0])||{};
+var res=performance.getEntriesByType?performance.getEntriesByType('resource'):[];
+pre.textContent='ОТЛАДКА\nзагрузок страницы за сессию: '+loads+'\nвозраст страницы: '+(performance.now()/1000).toFixed(1)+' с\nтип загрузки: '+(nav.type||'?')+'\nсмен адреса #: '+hc+
+'\nзапросов: '+Object.keys(reqs).map(function(k){return k+'×'+reqs[k]}).join(', ')+' (в полёте '+inflight+')'+
+'\nресурсов страницы: '+res.length+(res.length?' (последний: '+res[res.length-1].name.replace(location.origin,'')+')':'')+
+'\nготовность: '+document.readyState+'\n--- журнал ---\n'+logs.slice(-12).join('\n');
+}
+paint();setInterval(paint,700);
+}
+if(document.body)init();else document.addEventListener('DOMContentLoaded',init);
+})();
+</script>
+<script>
 const $=id=>document.getElementById(id);
 const el=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e};
 const clear=e=>{e.textContent=''};
@@ -421,23 +574,35 @@ document.getElementById('inst-text').textContent=ios
 ?'Откройте страницу в Safari, нажмите «Поделиться» и выберите «На экран Домой». Ярлык откроется без адресной строки, со своей иконкой.'
 :'В Chrome откройте меню ⋮ и выберите «Добавить на главный экран» (или «Установить приложение»). Ярлык получит свою иконку; адресная строка может остаться, потому что устройство отдаёт страницу по HTTP, без HTTPS.';
 })();
-let S={},offline=0,isScale=false,busy=false,pend='',askRes=null,cur=null,tt,ready=false,lastSt='';
+let S={},W=null,offline=0,isScale=false,busy=false,pend='',askRes=null,cur=null,tt,ready=false,lastSt='';
 const events=[];
 /* ---------- сообщения ---------- */
-function logEv(t){
-if(!t||(events[0]&&events[0].t===t))return;
-events.unshift({t:t,at:new Date()});if(events.length>30)events.pop();renderEv();
+function logEv(t,l,at){
+if(!t||(!at&&events[0]&&events[0].t===t&&events[0].l===(l||'i')))return;
+events.unshift({t:t,l:l||'i',at:at||new Date()});if(events.length>60)events.pop();renderEv();
+}
+let lastEv=0;
+async function pullEvents(){
+const j=await api('/events?after='+lastEv);
+if(j.last<lastEv)lastEv=0;            // устройство перезагрузилось: нумерация началась заново
+(j.ev||[]).forEach(e=>{
+if(e.i<=lastEv)return;
+lastEv=e.i;
+const at=e.t?new Date(e.t*1000):new Date();
+logEv(e.m,e.l,at);
+});
 }
 function renderEv(){
 const b=$('events');clear(b);
 if(!events.length){b.append(el('div','empty','Пока нет событий'));return}
-events.forEach(e=>{const r=el('div','ev');r.append(el('time',null,e.at.toLocaleTimeString('ru-RU')),el('span',null,e.t));b.append(r)});
+events.forEach(e=>{const r=el('div','ev'+(e.l==='e'?' e':e.l==='w'?' w':''));r.append(el('time',null,e.at.toLocaleTimeString('ru-RU')),el('span',null,e.t));b.append(r)});
 }
 function say(t,keep){
 const s=$('toast');clearTimeout(tt);
 if(!t){s.classList.remove('on');return}
-s.textContent=t;s.classList.add('on');logEv(t);
-if(!keep)tt=setTimeout(()=>s.classList.remove('on'),7000);
+s.textContent=t;s.classList.add('on');
+if(!/^Команда принята/.test(t))logEv(t,/Нет связи|Ошибка|Не удалось|не ответ|не найден|не на связи|повреждена|не подходит|слишком большой/i.test(t)?'e':'i');
+tt=setTimeout(()=>s.classList.remove('on'),keep?6500:2800);
 }
 $('toast').onclick=()=>say('');
 /* ---------- запросы ---------- */
@@ -449,13 +614,21 @@ finally{clearTimeout(id)}
 const post=(u,b,ms)=>api(u,b?{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(b)}:{method:'POST'},ms);
 function setBusy(b){busy=b;document.querySelectorAll('.btn,.net').forEach(x=>x.disabled=b)}
 /* ---------- разделы ---------- */
-const pages=['home','net','cal','sys','tests'];
+const pages=['home','net','sys','cal','cfg','tests'];
+const tabOf={cal:'sys',cfg:'sys',tests:'sys'};
+let curPage='';
 function go(p){
-if(!pages.includes(p)||(p==='cal'&&!isScale))p='home';
-pages.forEach(x=>{$('p-'+x).classList.toggle('on',x===p);$('t-'+x).setAttribute('aria-selected',x===p)});
+if(!pages.includes(p))p='home';
+if(p===curPage)return;
+curPage=p;
+const tab=tabOf[p]||p;
+pages.forEach(x=>$('p-'+x).classList.toggle('on',x===p));
+['home','net','sys'].forEach(x=>$('t-'+x).setAttribute('aria-selected',x===tab));
 scrollTo(0,0);
 }
-document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{location.hash=t.dataset.p});
+const nav=p=>{if(location.hash.slice(1)===p)go(p);else location.hash=p};
+document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>nav(t.dataset.p));
+document.querySelectorAll('[data-go]').forEach(t=>t.onclick=()=>nav(t.dataset.go));
 addEventListener('hashchange',()=>go(location.hash.slice(1)));
 /* ---------- отрисовка статуса ---------- */
 function bars(r){
@@ -464,9 +637,13 @@ b.setAttribute('aria-hidden','true');
 for(let i=1;i<=4;i++){const x=document.createElement('i');if(i<=n)x.className='on';b.append(x)}
 return b;
 }
-function put(id,node){const e=$(id);clear(e);if(node)e.append(node)}
+const sig={};
+function put(id,node,key){if(sig[id]===key)return;sig[id]=key;const e=$(id);clear(e);if(node)e.append(node)}
+const txt=(id,v)=>{const e=$(id);if(e.textContent!==v)e.textContent=v};
+const vis=(id,show)=>{const e=$(id);if(e.hidden===show)e.hidden=!show};
 function chip(c,t){$('chip').className='chip glass '+c;$('chiptxt').textContent=t}
 function renderCurve(s){
+if(sig.curve===s)return;sig.curve=s;
 const box=$('curve'),note=$('curve-note');clear(box);note.textContent='';
 if(!s||s.indexOf('нет точек')===0){
 note.textContent=s?'Точек пока нет ('+s.replace('нет точек, ','')+').':'Точек пока нет.';return;
@@ -475,41 +652,50 @@ s.split(' | ').forEach((p,i)=>box.append(el('span','pill',i===0?p.replace('но�
 }
 function render(j){
 isScale=j.kind==='scale';
-$('t-cal').style.display=isScale?'':'none';
+W=isScale?j:(j.scale||null);
 if(!ready){ready=true;go(location.hash.slice(1))}
-const title=j.title||'Floor Scale';$('title').textContent=title;document.title=title;
-$('sub').textContent=j.role||'Роль не определена';
+const title=j.title||'Floor Scale';txt('title',title);if(document.title!==title)document.title=title;
+txt('sub',j.role||'Роль не определена');
 const peerName=isScale?'Экран':'Весы';
-let c='',t='Ожидание сети',main='Ожидание сети',hint=j.status||'',peer='Ожидание сети';
+let c='',t='Ожидание сети',peer='Ожидание сети',main='Ожидание сети';
 if(j.peer_applicable){
-if(!j.peer_checked){c='wait';t='Проверка связи';main='Проверяем связь…';peer='Проверка…'}
-else if(j.peer_link){c='ok';t='Связь есть';main=peerName+' на связи';peer='Подключено — '+(j.peer_role||'сосед')}
-else{c='bad';t='Нет связи';main=peerName+' не найден';peer='Нет связи'}
+if(!j.peer_checked){c='wait';t='Проверка связи';peer='Проверка…';main='Проверяем связь…'}
+else if(j.peer_link){c='ok';t='Связь есть';peer='Подключено — '+(j.peer_role||'сосед');main='на связи'}
+else{c='bad';t='Нет связи';peer='Нет связи';main='не найдены'}
 }
 chip(c,t);
-$('hero-scale').hidden=!isScale;$('hero-screen').hidden=isScale;
-$('live').textContent=num(j.live);$('c-live').textContent=num(j.live);
-$('res').textContent=j.result==null?'нет данных':num(j.result)+' кг';
-$('hs-main').textContent=main;$('hs-sub').textContent=hint;
+// главная: вес (свой или от весов через экран) и кратко связь с калибровкой
+vis('hero-w',!!W);vis('hero-off',!W);
+if(W){txt('live',num(W.live));txt('c-live',num(W.live));txt('res',W.result==null?'нет данных':num(W.result)+' кг')}
+else{
+txt('c-live','—');
+txt('ho-main',j.peer_applicable&&j.peer_checked&&j.peer_link?'Ждём данные весов…':'Весы не на связи');
+txt('ho-sub',j.peer_applicable&&j.peer_checked&&j.peer_link?'Весы нашлись, данные ещё не пришли.':'Вес и калибровка появятся, когда экран найдёт весы.');
+}
+txt('h-peer-lab','Связь: '+peerName.toLowerCase());
+txt('h-peer',j.peer_applicable?(j.peer_checked?(j.peer_link?'Есть':'Нет'):'Проверка…'):'—');
+const cs=W&&W.curve;
+const npts=cs&&cs.indexOf('нет точек')!==0?cs.split(' | ').length-1:0;
+txt('h-cal',!W?'—':npts?npts+' '+(npts===1?'точка':npts<5?'точки':'точек'):'линейно');
+txt('l-cal',!W?'нет данных':npts?npts+' т.':'линейно');
+// сеть
 const net=j.network&&j.network!=='нет'?j.network:'Не подключено';
 const ip=j.ip&&j.ip!=='нет'?j.ip:'—';
-const rssi=parseInt(j.signal,10),sig=isNaN(rssi)?'—':rssi+' dBm';
-$('h-net').textContent=net;$('n-net').textContent=net;
-$('h-ip').textContent=ip;$('n-ip').textContent=ip;
-put('h-bars',bars(rssi));put('n-bars',bars(rssi));
-$('h-sig').textContent=sig;$('n-sig').textContent=sig;
-$('h-role').textContent=j.role||'не определён';
-$('h-st').textContent=j.status||'—';
-$('n-win').textContent=j.window?'Окно открыто: устройство принимает настройки сети от соседа.':'Окно закрыто. Пока оно закрыто, устройство не принимает новые настройки сети от соседа.';
-$('s-dev').textContent=title;$('s-role').textContent=j.role||'не определён';
-$('s-peer').textContent=peer;$('s-win').textContent=j.window?'Открыто':'Закрыто';
-$('s-clock').textContent=j.clock_ts?new Date(j.clock_ts*1000).toLocaleString('ru-RU'):'не задано';
-if(isScale)renderCurve(j.curve);
-if(j.status&&j.status!==lastSt){lastSt=j.status;if(j.status!=='Ожидание')logEv(j.status)}
+const rssi=parseInt(j.signal,10),sg=isNaN(rssi)?'—':rssi+' dBm';
+txt('n-net',net);txt('n-ip',ip);put('n-bars',bars(rssi),rssi);txt('n-sig',sg);
+txt('n-role',j.role||'не определён');txt('n-peer',peer);txt('n-st',j.status||'—');
+txt('n-win',j.window?'Окно открыто: устройство принимает настройки сети от соседа.':'Окно закрыто. Пока оно закрыто, устройство не принимает новые настройки сети от соседа.');
+// система
+txt('s-dev',title);
+txt('s-clock',j.clock_ts?new Date(j.clock_ts*1000).toLocaleString('ru-RU'):'не задано');
+vis('tc-pd',!isScale);
+// калибровка
+vis('cal-note',!W);
+if(W)renderCurve(W.curve);else renderCurve('');
 }
 async function refresh(){
 if(document.hidden)return;
-try{S=await api('/status');offline=0;render(S);syncClock(S)}
+try{S=await api('/status');offline=0;render(S);syncClock(S);pullEvents().catch(()=>{})}
 catch(e){if(++offline>=2){chip('bad','Нет связи со страницей')}}
 }
 /* ---------- время ---------- */
@@ -600,16 +786,17 @@ try{const j=await post('/connect',{ssid:ssid,pass:pass},60000);say(j.msg,!j.ok)}
 catch(e){say('Нет связи с устройством. Возможно, точка доступа перезапустилась: подождите минуту и обновите страницу.',true)}
 setBusy(false);closeSheet();refresh();
 }
+const calApi=(cmd,extra)=>isScale?post(cmd==='calib'?'/calib':cmd==='zero'?'/zero':'/curve_reset',extra):post('/peer_cmd',Object.assign({cmd:cmd},extra||{}));
 async function zeroIt(){
-if(busy)return;
-try{const j=await post('/zero');say(j.msg)}catch(e){say('Нет связи с устройством')}
+if(busy)return;if(!W){say('Весы не на связи');return}
+try{const j=await calApi('zero');say(j.msg,j.ok===false)}catch(e){say('Нет связи с устройством')}
 setTimeout(refresh,1500);
 }
 async function calibIt(){
-if(busy)return;
+if(busy)return;if(!W){say('Весы не на связи');return}
 const v=$('known').value;
 if(!v){say('Укажите известный вес');$('known').focus();return}
-try{const j=await post('/calib',{known:v});say(j.msg)}catch(e){say('Нет связи с устройством')}
+try{const j=await calApi('calib',{known:v});say(j.msg,j.ok===false)}catch(e){say('Нет связи с устройством')}
 setTimeout(refresh,1500);
 }
 async function rebootIt(){
@@ -627,11 +814,59 @@ catch(e){say('Нет связи с устройством')}
 setTimeout(refresh,1500);
 }
 async function curveReset(){
-if(busy)return;
+if(busy)return;if(!W){say('Весы не на связи');return}
 if(!await ask('Сбросить точки?','Все точки калибровки будут удалены.','Сбросить',true))return;
-try{const j=await post('/curve_reset');say(j.msg)}catch(e){say('Нет связи с устройством')}
+try{const j=await calApi('curve_reset');say(j.msg,j.ok===false)}catch(e){say('Нет связи с устройством')}
 setTimeout(refresh,1500);
 }
+/* ---------- экспорт и импорт настроек ---------- */
+async function exportCfg(){
+if(busy)return;
+setBusy(true);
+try{
+const j=await api('/export',null,15000);
+if(!j.ok){say(j.msg||'Не удалось создать файл',true);return}
+const text=JSON.stringify({app:j.app,v:j.v,kind:j.kind,blob:j.blob});
+$('x-out').value=text;$('x-box').hidden=false;
+$('x-info').textContent='В файле: сеть — '+(j.net?'да':'нет')+', калибровка — '+(j.cal?'да':'нет')+(!j.cal&&j.kind==='screen'?' (весы не ответили)':'');
+const d=new Date(),ymd=d.getFullYear()+String(d.getMonth()+1).padStart(2,'0')+String(d.getDate()).padStart(2,'0');
+const a=document.createElement('a');
+a.href=URL.createObjectURL(new Blob([text],{type:'application/json'}));
+a.download='floor-scale-'+j.kind+'-'+ymd+'.json';
+document.body.append(a);a.click();a.remove();
+setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+say('Файл настроек создан');
+}catch(e){say('Нет связи с устройством')}
+finally{setBusy(false)}
+}
+function copyCfg(){
+const t=$('x-out');t.focus();t.select();t.setSelectionRange(0,t.value.length);
+let ok=false;try{ok=document.execCommand('copy')}catch(e){}
+say(ok?'Текст скопирован':'Выделите текст и скопируйте вручную');
+}
+function parseCfg(t){
+t=(t||'').trim();if(!t)return null;
+try{const o=JSON.parse(t);if(o&&typeof o.blob==='string')t=o.blob}catch(e){}
+return /^[0-9a-fA-F]{60,}$/.test(t)?t:null;
+}
+async function importCfg(){
+if(busy)return;
+const blob=parseCfg($('i-in').value);
+if(!blob){say('Выберите файл настроек или вставьте его содержимое',true);return}
+if(!await ask('Импортировать настройки?','Сеть и калибровка из файла заменят текущие. Если сеть изменится, устройства перезагрузятся.','Импортировать',true))return;
+setBusy(true);prog('Импорт настроек','Применяем настройки на этом и втором устройстве…');
+try{const j=await post('/import',{blob:blob,forward:'1'},25000);say(j.msg||'Готово',j.ok===false);if(j.ok)$('i-in').value=''}
+catch(e){say('Устройство перезагружается или не отвечает. Подождите минуту и обновите страницу.',true)}
+setBusy(false);closeSheet();refresh();
+}
+$('b-export').onclick=exportCfg;$('b-copy').onclick=copyCfg;$('b-import').onclick=importCfg;
+$('b-file').onclick=()=>$('f-in').click();
+$('f-in').onchange=async e=>{
+const f=e.target.files&&e.target.files[0];if(!f)return;
+if(f.size>20000){say('Файл слишком большой для файла настроек',true);return}
+try{$('i-in').value=await f.text();say('Файл прочитан: '+f.name)}catch(err){say('Не удалось прочитать файл',true)}
+e.target.value='';
+};
 $('b-open').onclick=openWin;$('b-reset').onclick=resetNet;$('b-scan').onclick=scan;$('b-reboot').onclick=rebootIt;
 document.querySelectorAll('[data-test]').forEach(b=>b.onclick=()=>runTest(b.dataset.test));
 $('b-zero').onclick=zeroIt;$('b-calib').onclick=calibIt;$('b-curve').onclick=curveReset;
@@ -722,7 +957,7 @@ inline std::string local_role(std::string *connected_ssid = nullptr) {
 inline bool read_identity(const std::string &ip, const std::string &expected_kind,
                           std::string &role) {
   std::string response;
-  if (!prov_link::get_request("http://" + ip + "/peer_identity", response)) return false;
+  if (!prov_link::get_request("http://" + ip + "/peer_identity", response, 1500)) return false;
   const std::string kind_field = "\"kind\":\"" + expected_kind + "\"";
   if (response.find(kind_field) == std::string::npos) return false;
   const std::string key = "\"role\":\"";
@@ -754,14 +989,30 @@ inline bool resolve_peer_host(std::string &ip) {
 // раза в 10 минут. Раньше опрос был каждые 15 с и давал select() timeout в логе.
 inline constexpr uint32_t kNonPeerRecheckMs = 600000;
 
+inline std::string probe_ip;  // адрес, по которому последний раз ответил сосед
+
 inline bool probe_peer(std::string &peer_role) {
   const std::string expected = device_kind == "scale" ? "screen" : "scale";
   const std::string role = local_role();
-  if (role == "Клиент (слейв)")
-    return !peer_ap_ip.empty() && read_identity(peer_ap_ip, expected, peer_role);
+  if (role == "Клиент (слейв)") {
+    if (peer_ap_ip.empty() || !read_identity(peer_ap_ip, expected, peer_role)) return false;
+    probe_ip = peer_ap_ip;
+    return true;
+  }
   if (role == "Домашняя сеть") {
+    // Сначала последний рабочий адрес: mDNS-запрос теряется заметно чаще, чем HTTP.
+    if (!home_peer_ip.empty() && read_identity(home_peer_ip, expected, peer_role)) {
+      probe_ip = home_peer_ip;
+      return true;
+    }
     std::string ip;
-    return resolve_peer_host(ip) && read_identity(ip, expected, peer_role);
+    if (resolve_peer_host(ip) && read_identity(ip, expected, peer_role)) {
+      home_peer_ip = ip;
+      probe_ip = ip;
+      return true;
+    }
+    home_peer_ip.clear();
+    return false;
   }
   if (role != "Точка доступа (мастер)") return false;
 
@@ -798,6 +1049,7 @@ inline bool probe_peer(std::string &peer_role) {
     snprintf(ip, sizeof(ip), IPSTR, IP2STR(&pairs[i].ip));
     if (read_identity(ip, expected, peer_role)) {
       if (cache_slot >= 0) peer_candidate_cache[cache_slot].valid = false;
+      probe_ip = ip;
       return true;
     }
     if (cache_slot < 0) cache_slot = i % ESP_WIFI_MAX_CONN_NUM;
@@ -818,14 +1070,63 @@ inline void peer_monitor_task(void *) {
                             own_role == "Точка доступа (мастер)" ||
                             own_role == "Домашняя сеть";
     const bool linked = applicable && probe_peer(role);
-    if (peer_status_lock != nullptr && xSemaphoreTake(peer_status_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+    // Одиночный пропуск (потерянный пакет, занятый сосед) не должен сбрасывать связь:
+    // раньше из-за этого одно устройство видело соседа, а другое нет. Состояние
+    // «нет связи» ставим после трёх подряд неудачных проверок.
+    bool keep_state = false;
+    if (linked) {
+      peer_misses = 0;
+    } else if (applicable && peer_link_state && peer_misses < 2) {
+      peer_misses++;
+      keep_state = true;
+    }
+    if (!keep_state && peer_status_lock != nullptr &&
+        xSemaphoreTake(peer_status_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
       peer_link_state = linked;
       peer_check_applicable = applicable;
       peer_check_done = true;
       snprintf(peer_role_buf, sizeof(peer_role_buf), "%s", linked ? role.c_str() : "");
+      snprintf(peer_ip_buf, sizeof(peer_ip_buf), "%s", linked ? probe_ip.c_str() : "");
       xSemaphoreGive(peer_status_lock);
     }
-    vTaskDelay(pdMS_TO_TICKS(own_role == "Домашняя сеть" ? 30000 : 5000));
+    if (!keep_state && applicable) {
+      static bool prev_known = false, prev_linked = false;
+      if (!prev_known || linked != prev_linked)
+        evlog(linked ? 'i' : 'w', "Связь с соседом: %s", linked ? "есть" : "потеряна");
+      prev_known = true;
+      prev_linked = linked;
+    }
+    uint32_t wait = 5000;
+    if (own_role == "Домашняя сеть") wait = (linked && peer_misses == 0) ? 30000 : 8000;
+    vTaskDelay(pdMS_TO_TICKS(wait));
+  }
+}
+
+inline bool peer_ip_now(std::string &ip) {
+  ip.clear();
+  if (peer_status_lock != nullptr && xSemaphoreTake(peer_status_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (peer_link_state && peer_ip_buf[0] != '\0') ip = peer_ip_buf;
+    xSemaphoreGive(peer_status_lock);
+  }
+  return !ip.empty();
+}
+
+// Экран забирает у весов их /status раз в 2 с и показывает на своей странице
+// вес и калибровку. Запросы идут из отдельной задачи, а не из HTTP-обработчика.
+inline void peer_data_task(void *) {
+  while (true) {
+    std::string ip;
+    if (peer_ip_now(ip)) {
+      std::string r;
+      if (prov_link::get_request("http://" + ip + "/status", r, 1500) && r.size() > 2 &&
+          r.front() == '{' && r.back() == '}' && r.find("\"kind\":\"scale\"") != std::string::npos &&
+          peer_status_lock != nullptr && xSemaphoreTake(peer_status_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        peer_data = r;
+        peer_data_at = now_ms();
+        xSemaphoreGive(peer_status_lock);
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));
   }
 }
 
@@ -880,6 +1181,11 @@ inline std::string status_json() {
   out += std::string(",\"peer_link\":") + (linked ? "true" : "false");
   if (linked) out += ",\"peer_role\":\"" + json_escape(peer_role) + "\"";
   if (extra_status) out += "," + extra_status();
+  if (device_kind == "screen" && peer_status_lock != nullptr &&
+      xSemaphoreTake(peer_status_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
+    if (!peer_data.empty() && (uint32_t) (now_ms() - peer_data_at) < 10000) out += ",\"scale\":" + peer_data;
+    xSemaphoreGive(peer_status_lock);
+  }
   out += "}";
   return out;
 }
@@ -943,7 +1249,7 @@ static esp_err_t h_peer_identity(httpd_req_t *req) {
 }
 
 static esp_err_t send_scan_error(httpd_req_t *req, const char *where, esp_err_t e) {
-  ESP_LOGE(TAG_UI, "%s failed: %s", where, esp_err_to_name(e));
+  evlog('e', "%s failed: %s", where, esp_err_to_name(e));
   char err[160];
   snprintf(err, sizeof(err), "{\"error\":\"%s: %s\"}", where, esp_err_to_name(e));
   httpd_resp_set_type(req, "application/json; charset=utf-8");
@@ -1058,6 +1364,201 @@ static esp_err_t h_calib(httpd_req_t *req) {
 
 static esp_err_t h_curve_reset(httpd_req_t *req) {
   return queue_cmd(req, "curve_reset", 0.0f, (bool) on_curve_reset);
+}
+
+static esp_err_t reply_err(httpd_req_t *req, const std::string &m) {
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  std::string r = "{\"ok\":false,\"msg\":\"" + json_escape(m.c_str()) + "\"}";
+  return httpd_resp_send(req, r.c_str(), r.size());
+}
+
+// Экран пересылает команды калибровки весам. Адрес берём у проверки связи.
+// Новые события для страницы: GET /events?after=<последний полученный id>
+static esp_err_t h_events(httpd_req_t *req) {
+  uint32_t after = 0;
+  char q[48];
+  if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+    char v[16];
+    if (httpd_query_key_value(q, "after", v, sizeof(v)) == ESP_OK) after = (uint32_t) strtoul(v, nullptr, 10);
+  }
+  std::string out = "{\"ev\":[";
+  uint32_t last = 0;
+  if (ev_lock != nullptr && xSemaphoreTake(ev_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+    last = ev_last_id;
+    uint32_t first = after + 1;
+    if (last >= (uint32_t) kEvCount && first < last - kEvCount + 1) first = last - kEvCount + 1;
+    bool comma = false;
+    for (uint32_t id = first; id <= last; id++) {
+      const UiEvent &e = ev_ring[(id - 1) % kEvCount];
+      if (e.id != id) continue;
+      char head[96];
+      snprintf(head, sizeof(head), "%s{\"i\":%lu,\"t\":%lld,\"u\":%lu,\"l\":\"%c\",\"m\":\"", comma ? "," : "",
+               (unsigned long) e.id, e.ts, (unsigned long) e.up_s, e.lvl);
+      out += head;
+      out += json_escape(e.text);
+      out += "\"}";
+      comma = true;
+    }
+    xSemaphoreGive(ev_lock);
+  }
+  out += "],\"last\":" + std::to_string(last) + "}";
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  return httpd_resp_send(req, out.c_str(), out.size());
+}
+
+static esp_err_t h_peer_cmd(httpd_req_t *req) {
+  std::string b;
+  if (recv_body(req, b, 200) < 0) return reply_err(req, "Ошибка запроса");
+  const std::string cmd = form_value(b, "cmd");
+  std::string path, body;
+  if (cmd == "zero") path = "/zero";
+  else if (cmd == "curve_reset") path = "/curve_reset";
+  else if (cmd == "calib") { path = "/calib"; body = "known=" + form_value(b, "known"); }
+  else return reply_err(req, "Неизвестная команда");
+  std::string ip;
+  if (!peer_ip_now(ip)) return reply_err(req, "Весы не на связи");
+  std::string resp;
+  if (!prov_link::post_text("http://" + ip + path, body, resp) || resp.empty())
+    return reply_err(req, "Весы не ответили");
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  return httpd_resp_send(req, resp.c_str(), resp.size());
+}
+
+// ---- Экспорт / импорт настроек ----
+// Файл содержит один зашифрованный блок (тот же AES-256-GCM и ключ, что у передачи сети),
+// поэтому пароль Wi-Fi не лежит в нём открытым текстом и файл читается только устройствами пары.
+// Открытый текст: строки "FS1", "kind=…", "net=<hex ssid>,<hex пароль>", "cal=<числа>".
+inline std::string to_hex(const std::string &v) {
+  static const char H[] = "0123456789abcdef";
+  std::string o;
+  for (unsigned char c : v) { o += H[c >> 4]; o += H[c & 15]; }
+  return o;
+}
+inline bool from_hex(const std::string &h, std::string &out) {
+  std::vector<uint8_t> v;
+  out.clear();
+  if (h.empty()) return true;
+  if (!prov::hex_to_bytes(h, v)) return false;
+  out.assign((const char *) v.data(), v.size());
+  return true;
+}
+inline std::string line_value(const std::string &text, const char *key) {
+  const std::string k = std::string("\n") + key + "=";
+  size_t pos = text.find(k);
+  if (pos == std::string::npos) return "";
+  pos += k.size();
+  size_t end = text.find('\n', pos);
+  return text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+}
+
+inline std::string settings_plain(bool *has_net = nullptr, bool *has_cal = nullptr) {
+  std::string out = "FS1\nkind=" + device_kind + "\n";
+  std::string ssid;
+  bool net = false, cal = false;
+  if (wifi_comp_ptr != nullptr && netrole::saved_sta(ssid) && ssid != setup_ssid) {
+    out += "net=" + to_hex(ssid) + "," + to_hex(wifi_comp_ptr->get_sta().get_password().str()) + "\n";
+    net = true;
+  }
+  std::string cal_text;
+  if (export_cal) {
+    cal_text = export_cal();
+  } else if (device_kind == "screen") {
+    // Калибровка хранится на весах: просим у них такой же файл и берём из него строку cal
+    std::string ip, r;
+    if (peer_ip_now(ip) && prov_link::get_request("http://" + ip + "/export", r, 2500)) {
+      const std::string key = "\"blob\":\"";
+      size_t pos = r.find(key);
+      size_t end = pos == std::string::npos ? pos : r.find('"', pos + key.size());
+      std::string plain;
+      if (end != std::string::npos &&
+          prov::decrypt_text(prov_key.c_str(), r.substr(pos + key.size(), end - pos - key.size()), plain))
+        cal_text = line_value(plain, "cal");
+    }
+  }
+  if (!cal_text.empty()) { out += "cal=" + cal_text + "\n"; cal = true; }
+  if (has_net) *has_net = net;
+  if (has_cal) *has_cal = cal;
+  return out;
+}
+
+static esp_err_t h_export(httpd_req_t *req) {
+  bool net = false, cal = false;
+  const std::string plain = settings_plain(&net, &cal);
+  std::string blob;
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  if (!prov::encrypt_text(prov_key.c_str(), plain, blob))
+    return httpd_resp_sendstr(req, "{\"ok\":false,\"msg\":\"Не удалось зашифровать настройки\"}");
+  std::string r = std::string("{\"ok\":true,\"app\":\"floor-scale\",\"v\":1,\"kind\":\"") + device_kind +
+                  "\",\"net\":" + (net ? "true" : "false") + ",\"cal\":" + (cal ? "true" : "false") +
+                  ",\"blob\":\"" + blob + "\"}";
+  return httpd_resp_send(req, r.c_str(), r.size());
+}
+
+static esp_err_t h_import(httpd_req_t *req) {
+  std::string b;
+  if (recv_body(req, b, 3000) < 0) return reply_err(req, "Ошибка запроса или файл слишком большой");
+  const std::string blob = form_value(b, "blob");
+  const bool forward = form_value(b, "forward") == "1";
+  std::string plain;
+  if (!prov::decrypt_text(prov_key.c_str(), blob, plain) || plain.compare(0, 4, "FS1\n") != 0)
+    return reply_err(req, "Файл не подходит: другой ключ или повреждён");
+  plain = "\n" + plain;
+
+  std::string ssid, pass;
+  bool has_net = false;
+  const std::string net = line_value(plain, "net");
+  if (!net.empty()) {
+    const size_t comma = net.find(',');
+    std::string h1 = net.substr(0, comma), h2 = comma == std::string::npos ? "" : net.substr(comma + 1);
+    if (comma == std::string::npos || !from_hex(h1, ssid) || !from_hex(h2, pass) || ssid.empty() ||
+        ssid.size() > 32 || pass.size() > 64)
+      return reply_err(req, "В файле неверные данные сети");
+    has_net = true;
+  }
+  const std::string cal = line_value(plain, "cal");
+  std::string msg;
+
+  // Сначала сосед: после смены сети это устройство перезагрузится
+  bool forwarded = false;
+  if (forward) {
+    std::string ip, resp;
+    forwarded = peer_ip_now(ip) &&
+        prov_link::post_text("http://" + ip + "/import", "forward=0&blob=" + blob, resp, "application/x-www-form-urlencoded", 4000) &&
+        resp.find("\"ok\":true") != std::string::npos;
+  }
+
+  bool cal_applied = false;
+  if (!cal.empty() && import_cal) {
+    if (cmd_pending) return reply_err(req, "Предыдущая команда ещё выполняется");
+    cmd_text = cal;
+    cmd_name = "import_cal";
+    cmd_pending = true;
+    for (int i = 0; i < 30 && cmd_pending; i++) vTaskDelay(pdMS_TO_TICKS(100));
+    cal_applied = !cmd_pending;
+  }
+
+  bool net_changed = false;
+  if (has_net) {
+    std::string cur;
+    const bool have = netrole::saved_sta(cur);
+    const std::string cur_pass = (have && wifi_comp_ptr) ? wifi_comp_ptr->get_sta().get_password().str() : "";
+    net_changed = !have || cur != ssid || cur_pass != pass;
+  }
+
+  if (cal_applied) msg += "Калибровка применена. ";
+  if (!cal.empty() && !import_cal) msg += forwarded ? "Калибровка передана весам. " : "Калибровка не передана: весы не на связи. ";
+  if (has_net) msg += net_changed ? "Сеть «" + ssid + "» сохранена, устройство перезагружается. " : "Сеть уже такая же. ";
+  if (forward && !forwarded) msg += "Второе устройство не ответило. ";
+  if (msg.empty()) msg = "В файле нет настроек для этого устройства";
+  while (!msg.empty() && msg.back() == ' ') msg.pop_back();
+  set_status(msg);
+
+  std::string r = std::string("{\"ok\":true,\"reboot\":") + (net_changed && on_creds ? "true" : "false") +
+                  ",\"msg\":\"" + json_escape(msg.c_str()) + "\"}";
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  httpd_resp_send(req, r.c_str(), r.size());
+  if (net_changed && on_creds) on_creds(ssid, pass);
+  return ESP_OK;
 }
 
 // Проверка сети и передача зашифрованных учётных данных соседу.
@@ -1182,6 +1683,8 @@ static const char *test_label(const std::string &n) {
   if (n == "test_role") return "состояние роли";
   if (n == "test_scan") return "скан эфира";
   if (n == "test_peer") return "проверка соседа";
+  if (n == "test_peer_data") return "данные весов на экране";
+  if (n == "test_export") return "экспорт настроек";
   if (n == "test_tiebreak") return "тай-брейк: сброс обоих";
   return nullptr;
 }
@@ -1190,22 +1693,22 @@ static void test_task(void *arg) {
   char *name = static_cast<char *>(arg);
   const char *label = test_label(name);
   const std::string self = name;
-  ESP_LOGI(TAG_UI, "[%s] ТЕСТ НАЧАТ: %s", clock_stamp().c_str(), label ? label : self.c_str());
+  evlog('i', "[%s] ТЕСТ НАЧАТ: %s", clock_stamp().c_str(), label ? label : self.c_str());
   if (self == "test_marker") {
-    ESP_LOGI(TAG_UI, "[%s] МАРКЕР: отметка для поиска момента в журнале", clock_stamp().c_str());
+    evlog('i', "[%s] МАРКЕР: отметка для поиска момента в журнале", clock_stamp().c_str());
     set_status("Маркер записан в журнал");
   } else if (self == "test_role") {
     std::string saved;
     const bool has_saved = netrole::saved_sta(saved);
-    ESP_LOGI(TAG_UI, "[%s] роль: %s", clock_stamp().c_str(), local_role().c_str());
-    ESP_LOGI(TAG_UI, "[%s] своя точка активна: %s; сохранённая сеть: %s; связь с соседом: %s",
+    evlog('i', "[%s] роль: %s", clock_stamp().c_str(), local_role().c_str());
+    evlog('i', "[%s] своя точка активна: %s; сохранённая сеть: %s; связь с соседом: %s",
              clock_stamp().c_str(), netrole::own_ap_active() ? "да" : "нет",
              has_saved ? saved.c_str() : "нет", peer_link_state ? "да" : "нет");
     set_status("Состояние роли записано в журнал");
   } else if (self == "test_scan") {
     uint8_t bssid[6] = {0};
     const bool found = netrole::find_bssid(setup_ssid, bssid);
-    ESP_LOGI(TAG_UI, "[%s] скан завершён: точка настройки %s", clock_stamp().c_str(),
+    evlog('i', "[%s] скан завершён: точка настройки %s", clock_stamp().c_str(),
              found ? "найдена" : "не найдена");
     set_status(found ? "Скан: точка настройки найдена" : "Скан: точка настройки не найдена");
   } else if (self == "test_peer") {
@@ -1216,22 +1719,54 @@ static void test_task(void *arg) {
       const std::string url = "http://" + host + "/peer_identity";
       const uint32_t t0 = now_ms();
       const bool ok = prov_link::get_request(url, resp, 2000);
-      ESP_LOGI(TAG_UI, "[%s] сосед %s: %s, %u байт, %lu мс", clock_stamp().c_str(), host.c_str(),
+      evlog('i', "[%s] сосед %s: %s, %u байт, %lu мс", clock_stamp().c_str(), host.c_str(),
                ok ? "ответил" : "не ответил", (unsigned) resp.size(),
                (unsigned long) (now_ms() - t0));
     }
+    std::string known_ip;
+    evlog('i', "[%s] адрес соседа из проверки связи: %s; кэш домашней сети: %s; пропусков подряд: %d",
+             clock_stamp().c_str(), peer_ip_now(known_ip) ? known_ip.c_str() : "нет",
+             home_peer_ip.empty() ? "пуст" : home_peer_ip.c_str(), peer_misses);
     set_status("Проверка соседа записана в журнал");
+  } else if (self == "test_peer_data") {
+    if (device_kind != "screen") {
+      evlog('i', "[%s] тест нужен только на экране", clock_stamp().c_str());
+      set_status("Тест выполняется на экране");
+    } else {
+      uint32_t age = 0;
+      size_t size = 0;
+      bool have = false;
+      if (peer_status_lock != nullptr && xSemaphoreTake(peer_status_lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+        have = !peer_data.empty();
+        size = peer_data.size();
+        age = now_ms() - peer_data_at;
+        xSemaphoreGive(peer_status_lock);
+      }
+      evlog('i', "[%s] данные весов: %s, %u байт, возраст %lu мс", clock_stamp().c_str(),
+               have ? "есть" : "нет", (unsigned) size, (unsigned long) age);
+      set_status(have && age < 10000 ? "Данные весов свежие" : "Данных весов нет или они устарели");
+    }
+  } else if (self == "test_export") {
+    bool net = false, cal = false;
+    const std::string plain = settings_plain(&net, &cal);
+    std::string blob, back;
+    const bool enc = prov::encrypt_text(prov_key.c_str(), plain, blob);
+    const bool dec = enc && prov::decrypt_text(prov_key.c_str(), blob, back) && back == plain;
+    evlog('i', "[%s] экспорт: сеть=%s, калибровка=%s, блок %u байт, шифрование и расшифровка %s",
+             clock_stamp().c_str(), net ? "да" : "нет", cal ? "да" : "нет", (unsigned) blob.size(),
+             dec ? "успешны" : "НЕ ПРОШЛИ");
+    set_status(dec ? "Экспорт: шифрование проверено" : "Экспорт: ошибка шифрования");
   } else if (self == "test_tiebreak") {
-    ESP_LOGI(TAG_UI, "[%s] сброс обоих: команда соседу и перезагрузка этого устройства", clock_stamp().c_str());
+    evlog('i', "[%s] сброс обоих: команда соседу и перезагрузка этого устройства", clock_stamp().c_str());
     const bool peer_ok = reset_peer_now();
-    ESP_LOGI(TAG_UI, "[%s] сосед %s", clock_stamp().c_str(),
+    evlog('i', "[%s] сосед %s", clock_stamp().c_str(),
              peer_ok ? "принял сброс" : "не ответил: сбрасывается только это устройство");
     mark_reset_pending();
     set_status("Сброс: перезагрузка для теста тай-брейка");
     vTaskDelay(pdMS_TO_TICKS(1000));
     if (on_reset) on_reset();  // перезагрузка; итог роли запишется после загрузки
   }
-  ESP_LOGI(TAG_UI, "[%s] ТЕСТ ЗАВЕРШЁН: %s", clock_stamp().c_str(), label ? label : self.c_str());
+  evlog('i', "[%s] ТЕСТ ЗАВЕРШЁН: %s", clock_stamp().c_str(), label ? label : self.c_str());
   free(name);
   test_busy = false;
   vTaskDelete(nullptr);
@@ -1242,7 +1777,7 @@ inline void tiebreak_check_task(void *) {
   vTaskDelay(pdMS_TO_TICKS(70000));
   std::string saved;
   const bool has_saved = netrole::saved_sta(saved);
-  ESP_LOGI(TAG_UI, "[%s] ТЕСТ ТАЙ-БРЕЙК, итог после сброса: роль=%s; своя точка активна=%s; сохранённая сеть=%s; связь с соседом=%s",
+  evlog('i', "[%s] ТЕСТ ТАЙ-БРЕЙК, итог после сброса: роль=%s; своя точка активна=%s; сохранённая сеть=%s; связь с соседом=%s",
            clock_stamp().c_str(), local_role().c_str(), netrole::own_ap_active() ? "да" : "нет",
            has_saved ? saved.c_str() : "нет", peer_link_state ? "да" : "нет");
   clear_reset_pending();
@@ -1276,7 +1811,7 @@ static esp_err_t h_test(httpd_req_t *req) {
 static esp_err_t h_reboot(httpd_req_t *req) {
   httpd_resp_set_type(req, "application/json; charset=utf-8");
   if (!on_reboot) return reply_msg(req, "Перезагрузка не поддерживается");
-  ESP_LOGW(TAG_UI, "reboot requested from web page");
+  evlog('w', "reboot requested from web page");
   set_status("Перезагрузка по команде со страницы");
   httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"Перезагрузка\"}");
   vTaskDelay(pdMS_TO_TICKS(250));
@@ -1297,7 +1832,7 @@ static esp_err_t h_time(httpd_req_t *req) {
   const std::string tz = form_value(b, "tz");
   if (!tz.empty()) clock_tz_min = (int) strtol(tz.c_str(), nullptr, 10);
   clock_set_at = ts;
-  ESP_LOGI(TAG_UI, "[%s] время задано со страницы", clock_stamp().c_str());
+  evlog('i', "[%s] время задано со страницы", clock_stamp().c_str());
   return reply_msg(req, "Время установлено");
 }
 
@@ -1341,7 +1876,7 @@ static esp_err_t h_prov(httpd_req_t *req) {
 inline void reg_uri(httpd_handle_t srv, const httpd_uri_t &u) {
   const esp_err_t err = httpd_register_uri_handler(srv, &u);
   if (err != ESP_OK) {
-    ESP_LOGE(TAG_UI, "register %s failed: %s", u.uri, esp_err_to_name(err));
+    evlog('e', "register %s failed: %s", u.uri, esp_err_to_name(err));
   }
 }
 
@@ -1349,14 +1884,14 @@ inline void start(int port) {
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port = port;
   // По умолчанию 8 обработчиков; у нас 12 маршрутов, лишние тихо отбрасывались (404)
-  cfg.max_uri_handlers = 24;
+  cfg.max_uri_handlers = 28;
   // web_server ESPHome больше не используется, но порт управления оставляем отдельным
   cfg.ctrl_port = 32769;
   // Стек по умолчанию (4 КБ) переполняется в обработчике сканирования
   cfg.stack_size = 12288;
   httpd_handle_t srv = nullptr;
   if (httpd_start(&srv, &cfg) != ESP_OK) {
-    ESP_LOGE(TAG_UI, "httpd start failed on port %d", port);
+    evlog('e', "httpd start failed on port %d", port);
     return;
   }
 
@@ -1375,8 +1910,9 @@ inline void start(int port) {
   if (peer_status_lock == nullptr) peer_status_lock = xSemaphoreCreateMutex();
   if (peer_status_lock != nullptr) {
     xTaskCreate(peer_monitor_task, "peer_monitor", 8192, nullptr, 1, nullptr);
+    if (device_kind == "screen") xTaskCreate(peer_data_task, "peer_data", 6144, nullptr, 1, nullptr);
   } else {
-    ESP_LOGE(TAG_UI, "cannot create peer status mutex");
+    evlog('e', "cannot create peer status mutex");
   }
 
   u = {};
@@ -1424,6 +1960,18 @@ inline void start(int port) {
   u.uri = "/test"; u.method = HTTP_POST; u.handler = h_test;
   reg_uri(srv, u);
 
+  u = {};
+  u.uri = "/events"; u.method = HTTP_GET; u.handler = h_events;
+  reg_uri(srv, u);
+  u = {};
+  u.uri = "/peer_cmd"; u.method = HTTP_POST; u.handler = h_peer_cmd;
+  reg_uri(srv, u);
+  u = {};
+  u.uri = "/export"; u.method = HTTP_GET; u.handler = h_export;
+  reg_uri(srv, u);
+  u = {};
+  u.uri = "/import"; u.method = HTTP_POST; u.handler = h_import;
+  reg_uri(srv, u);
   u = {};
   u.uri = "/manifest.webmanifest"; u.method = HTTP_GET; u.handler = h_manifest;
   reg_uri(srv, u);

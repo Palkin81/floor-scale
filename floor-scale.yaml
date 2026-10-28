@@ -95,6 +95,51 @@ esphome:
             id(curve_dirty) = 1;
             return "Кривая сброшена";
           };
+          // Экспорт калибровки: "ноль,кг1,отсч1,…,кг5,отсч5"
+          ui::export_cal = []() -> std::string {
+            auto f = [](float v) { return isnan(v) ? 0.0f : v; };
+            char t[200];
+            snprintf(t, sizeof(t), "%.0f,%.1f,%.0f,%.1f,%.0f,%.1f,%.0f,%.1f,%.0f,%.1f,%.0f",
+                     f(id(zero_raw).state),
+                     f(id(p1_kg).state), f(id(p1_counts).state), f(id(p2_kg).state), f(id(p2_counts).state),
+                     f(id(p3_kg).state), f(id(p3_counts).state), f(id(p4_kg).state), f(id(p4_counts).state),
+                     f(id(p5_kg).state), f(id(p5_counts).state));
+            return std::string(t);
+          };
+          // Импорт: строго 11 чисел в допустимых пределах, иначе ничего не меняем
+          ui::import_cal = [](const std::string &text) -> std::string {
+            float v[11];
+            const char *p = text.c_str();
+            for (int i = 0; i < 11; i++) {
+              char *end = nullptr;
+              v[i] = strtof(p, &end);
+              if (end == p || !std::isfinite(v[i])) return "Калибровка в файле повреждена";
+              const bool is_kg = i > 0 && (i % 2) == 1;
+              if (is_kg ? (v[i] < 0.0f || v[i] > 300.0f) : fabsf(v[i]) > 10000000.0f)
+                return "Калибровка в файле вне допустимых пределов";
+              p = end;
+              if (i < 10) {
+                if (*p != ',') return "Калибровка в файле повреждена";
+                p++;
+              }
+            }
+            id(cal_arm) = 0;
+            id(cal_buf).clear();
+            id(zero_raw).make_call().set_value(v[0]).perform();
+            id(baseline) = v[0];
+            id(p1_kg).make_call().set_value(v[1]).perform();
+            id(p1_counts).make_call().set_value(v[2]).perform();
+            id(p2_kg).make_call().set_value(v[3]).perform();
+            id(p2_counts).make_call().set_value(v[4]).perform();
+            id(p3_kg).make_call().set_value(v[5]).perform();
+            id(p3_counts).make_call().set_value(v[6]).perform();
+            id(p4_kg).make_call().set_value(v[7]).perform();
+            id(p4_counts).make_call().set_value(v[8]).perform();
+            id(p5_kg).make_call().set_value(v[9]).perform();
+            id(p5_counts).make_call().set_value(v[10]).perform();
+            id(curve_dirty) = 1;
+            return "Калибровка импортирована";
+          };
           ui::wifi_comp_ptr = id(wifi_comp);
           ui::open_window(${window_ms});
           ui::set_status("Окно настройки открыто на 5 минут");
