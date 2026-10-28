@@ -1,0 +1,88 @@
+# Проверочная сборка обеих прошивок на каждый PR и пуш в main.
+# Секреты здесь выдуманные: собирается только проверка «компилируется ли».
+# Рабочие прошивки с настоящим ключом в публичном репозитории не собираем и не выкладываем.
+name: Проверка сборки
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: compile-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  ESPHOME_VERSION: "2026.10.0"
+
+jobs:
+  page:
+    name: Страница вшита в прошивку
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 ui/embed.py --check
+
+  compile:
+    name: Сборка ${{ matrix.config }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [floor-scale.yaml, screen_stub.yaml]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Кэш сборки
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.esphome
+            ~/.platformio
+            ~/.cache/pip
+          key: esphome-${{ env.ESPHOME_VERSION }}-${{ matrix.config }}-${{ hashFiles('*.yaml') }}
+          restore-keys: |
+            esphome-${{ env.ESPHOME_VERSION }}-${{ matrix.config }}-
+            esphome-${{ env.ESPHOME_VERSION }}-
+
+      - name: Установка ESPHome
+        run: pip install "esphome==${ESPHOME_VERSION}"
+
+      - name: Выдуманные секреты для проверки
+        run: |
+          KEY=$(python3 -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())")
+          {
+            echo "espectre_encryption_key: \"${KEY}\""
+            echo 'prov_ssid: "scale_setup_net"'
+            echo 'prov_password: "ci-dummy-password"'
+          } > secrets.yaml
+
+      - name: Проверка конфигурации
+        run: esphome config ${{ matrix.config }} > /dev/null
+
+      - name: Сборка
+        shell: bash
+        run: |
+          set +e
+          esphome compile ${{ matrix.config }} 2>&1 | tee build.log
+          code=${PIPESTATUS[0]}
+          # Короткая выдержка попадает в аннотации запуска: читается без скачивания полного журнала
+          esc() { sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}'; }
+          if [ "$code" -ne 0 ]; then
+            msg=$(grep -nE "error|Error|FAILED|undefined reference" build.log | head -40 | esc)
+            echo "::error title=Сборка ${{ matrix.config }} не удалась::${msg}"
+          else
+            msg=$(grep -E "RAM:|Flash:" build.log | tail -3 | esc)
+            echo "::notice title=Размер ${{ matrix.config }}::${msg}"
+          fi
+          exit "$code"
