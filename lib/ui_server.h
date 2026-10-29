@@ -3,6 +3,7 @@
 // окно настройки, приём зашифрованных кредов, сброс сети.
 // Заменяет встроенный web_server ESPHome. Черновик, не проверен на железе.
 
+#include <array>
 #include <string>
 #include <vector>
 #include <functional>
@@ -30,6 +31,7 @@
 
 #include "ui_icons.h"
 #include "esp_ota_ops.h"
+#include "esphome/core/application.h"
 #include "esphome/components/ota/ota_backend_factory.h"
 
 namespace ui {
@@ -1499,7 +1501,7 @@ inline const char *chip_name() {
 }
 
 struct UpdateInfo {
-  std::string running, next, name, date, time;
+  std::string running, next, name, build, sha;
   uint32_t max = 0;
 };
 inline UpdateInfo read_update_info() {
@@ -1511,10 +1513,16 @@ inline UpdateInfo read_update_info() {
     esp_app_desc_t d = {};
     if (esp_ota_get_partition_description(run, &d) == ESP_OK) {
       u.name = d.project_name;
-      u.date = d.date;
-      u.time = d.time;
+      // ESPHome включает воспроизводимую сборку: date/time в образе пустые.
+      // Отличаем сборки по хэшу ELF (меняется при любой правке кода).
+      char hex[9];
+      for (int i = 0; i < 4; i++) snprintf(hex + i * 2, 3, "%02x", d.app_elf_sha256[i]);
+      u.sha = hex;
     }
   }
+  std::array<char, esphome::Application::BUILD_TIME_STR_SIZE> bt{};
+  esphome::App.get_build_time_string(bt);
+  u.build = bt.data();
   if (next != nullptr) {
     u.next = next->label;
     u.max = next->size;
@@ -1529,7 +1537,7 @@ static esp_err_t h_update_info(httpd_req_t *req) {
   std::string r = head;
   r += "\"chip\":\"" + json_escape(chip_name()) + "\",\"running\":\"" + json_escape(u.running.c_str()) +
        "\",\"next\":\"" + json_escape(u.next.c_str()) + "\",\"name\":\"" + json_escape(u.name.c_str()) +
-       "\",\"built\":\"" + json_escape((u.date + " " + u.time).c_str()) + "\",\"busy\":" +
+       "\",\"built\":\"" + json_escape((u.build + " · " + u.sha).c_str()) + "\",\"busy\":" +
        (update_busy ? "true" : "false") + "}";
   httpd_resp_set_type(req, "application/json; charset=utf-8");
   return httpd_resp_send(req, r.c_str(), r.size());
@@ -2013,8 +2021,8 @@ static void test_task(void *arg) {
     evlog('i', "[%s] обновление: платформа %s (chip_id %u); запущено из %s, следующий раздел %s, место %lu байт",
           clock_stamp().c_str(), chip_name(), (unsigned) expected_chip_id(), u.running.c_str(), u.next.c_str(),
           (unsigned long) u.max);
-    evlog('i', "[%s] обновление: сборка %s %s, проект %s, загрузка сейчас %s", clock_stamp().c_str(),
-          u.date.c_str(), u.time.c_str(), u.name.c_str(), update_busy ? "идёт" : "не идёт");
+    evlog('i', "[%s] обновление: сборка %s, хэш образа %s, проект %s, загрузка сейчас %s", clock_stamp().c_str(),
+          u.build.c_str(), u.sha.c_str(), u.name.c_str(), update_busy ? "идёт" : "не идёт");
     set_status(u.max > 0 ? "Обновление возможно: раздел найден" : "Нет раздела для обновления");
   } else if (self == "test_export") {
     bool net = false, cal = false;
