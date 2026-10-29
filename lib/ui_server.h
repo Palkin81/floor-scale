@@ -139,7 +139,7 @@ inline void add_event(char lvl, const char *text) {
 
 // Пишет и в журнал устройства, и в «События». Формат как у printf; префикс "[время] " в событие не попадает.
 inline void evlog(char lvl, const char *fmt, ...) {
-  char buf[200];
+  char buf[320];  // кириллица занимает 2 байта на букву: 200 обрезали длинные строки тестов
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -2018,9 +2018,9 @@ static void test_task(void *arg) {
     }
   } else if (self == "test_update") {
     const UpdateInfo u = read_update_info();
-    evlog('i', "[%s] обновление: платформа %s (chip_id %u); запущено из %s, следующий раздел %s, место %lu байт",
-          clock_stamp().c_str(), chip_name(), (unsigned) expected_chip_id(), u.running.c_str(), u.next.c_str(),
-          (unsigned long) u.max);
+    evlog('i', "[%s] обновление: платформа %s (chip_id %u), запущено из %s, следующий раздел %s",
+          clock_stamp().c_str(), chip_name(), (unsigned) expected_chip_id(), u.running.c_str(), u.next.c_str());
+    evlog('i', "[%s] обновление: место в разделе %lu байт", clock_stamp().c_str(), (unsigned long) u.max);
     evlog('i', "[%s] обновление: сборка %s, хэш образа %s, проект %s, загрузка сейчас %s", clock_stamp().c_str(),
           u.build.c_str(), u.sha.c_str(), u.name.c_str(), update_busy ? "идёт" : "не идёт");
     set_status(u.max > 0 ? "Обновление возможно: раздел найден" : "Нет раздела для обновления");
