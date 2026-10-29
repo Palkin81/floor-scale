@@ -50,7 +50,7 @@ jobs:
             ~/.esphome
             ~/.platformio
             ~/.cache/pip
-          key: esphome-${{ env.ESPHOME_VERSION }}-${{ matrix.config }}-${{ hashFiles('*.yaml') }}
+          key: esphome-${{ env.ESPHOME_VERSION }}-${{ matrix.config }}-${{ hashFiles('*.yaml', 'packages/*.yaml') }}
           restore-keys: |
             esphome-${{ env.ESPHOME_VERSION }}-${{ matrix.config }}-
             esphome-${{ env.ESPHOME_VERSION }}-
@@ -86,3 +86,43 @@ jobs:
             echo "::notice title=Размер ${{ matrix.config }}::${msg}"
           fi
           exit "$code"
+
+  # Только для PR: итоговая конфигурация ESPHome (после слияния пакетов) до и после изменений.
+  # Нужна для рефакторингов YAML: подтверждает, что поведение не менялось. Результат в аннотации.
+  config-diff:
+    name: Сравнение итоговой конфигурации с main
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: new
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref }}
+          path: old
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install "esphome==${ESPHOME_VERSION}"
+      - name: Сравнение
+        shell: bash
+        run: |
+          KEY=$(python3 -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())")
+          for d in old new; do
+            {
+              echo "espectre_encryption_key: \"${KEY}\""
+              echo 'prov_ssid: "scale_setup_net"'
+              echo 'prov_password: "ci-dummy-password"'
+            } > $d/secrets.yaml
+          done
+          esc() { sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}'; }
+          for f in floor-scale screen_stub; do
+            (cd old && esphome config $f.yaml > ../$f.old.txt 2>&1)
+            (cd new && esphome config $f.yaml > ../$f.new.txt 2>&1)
+            diff -u $f.old.txt $f.new.txt > $f.diff
+            n=$(grep -c '^[+-][^+-]' $f.diff || true)
+            msg=$(head -c 3500 $f.diff | esc)
+            echo "::notice title=Различия $f.yaml: ${n} строк::${msg}"
+          done

@@ -1,0 +1,173 @@
+# Общая часть обоих устройств (весы и экран): сеть, роль, веб-страница, обновление.
+# Подключается через `packages:` в floor-scale.yaml и screen_stub.yaml.
+# Что должно быть задано в самом устройстве:
+#   substitutions: ap_ip (адрес собственной точки доступа);
+#   script `device_setup` (свойства устройства: вид, имя, адрес соседа, хуки калибровки);
+#   esphome.name / friendly_name, раздел esp32 (плата), датчики.
+# on_boot определён только здесь (словари esphome.on_boot из нескольких файлов не сливаем).
+
+substitutions:
+  window_ms: "300000"                              # окно настройки: 5 минут
+  prov_key_b64: !secret espectre_encryption_key    # base64 от 32 байт, тот же что для API
+  prov_ssid: !secret prov_ssid
+  prov_password: !secret prov_password
+
+esphome:
+  includes:
+    - lib/prov_crypto.h
+    - lib/prov_link.h
+    - lib/wifi_probe.h
+    - lib/net_role.h
+    - lib/ui_icons.h
+    - lib/ui_server.h
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          netrole::start_logging();
+          ui::prov_key = "${prov_key_b64}";
+          ui::setup_ssid = "${prov_ssid}";
+          ui::on_reset = []() {
+            const bool cleared = netrole::clear_saved_sta(id(wifi_comp));
+            ESP_LOGI("reset", "persistent Wi-Fi credentials cleared=%s", cleared ? "yes" : "no");
+            App.reboot();
+          };
+          ui::on_reboot = []() { App.reboot(); };
+          ui::on_creds = [](const std::string &ssid, const std::string &pass) {
+            id(wifi_comp)->save_wifi_sta(ssid, pass);
+            delay(1000);
+            App.reboot();
+          };
+      # Свойства устройства: вид, имя, адрес соседа, хуки калибровки (скрипт без задержек, выполняется сразу)
+      - script.execute: device_setup
+      - lambda: |-
+          ui::wifi_comp_ptr = id(wifi_comp);
+          ui::open_window(${window_ms});
+          ui::set_status("Окно настройки открыто на 5 минут");
+          ui::start(80);
+      - script.execute: pick_role
+
+esp32:
+  framework:
+    type: esp-idf
+    advanced:
+      include_builtin_idf_components:
+        - esp_http_server
+        - esp_http_client
+
+logger:
+  level: INFO
+  logs:
+    component: ERROR
+
+api:
+  # Без Home Assistant клиентов устройство по умолчанию перезагружается каждые
+  # 15 минут («No clients; rebooting»), что рвёт сеть настройки.
+  reboot_timeout: 0s
+  encryption:
+    key: !secret espectre_encryption_key
+
+ota:
+  - platform: esphome
+    encryption:
+      key: !secret espectre_encryption_key
+
+wifi:
+  id: wifi_comp
+  # Клиентских попыток к сети настройки нет: они перезапускают адаптер и рвут точку.
+  # Сохранённая домашняя сеть подключается как раньше; сохранённая сеть настройки
+  # проверяется скриптом ролей и не считается домашним STA-подключением.
+
+  # Точка доступа для настройки
+  ap:
+    ssid: ${prov_ssid}
+    password: ${prov_password}
+    # Start the fallback AP after 40 seconds without a successful STA connection.
+    ap_timeout: 40s
+    manual_ip:
+      static_ip: ${ap_ip}
+      gateway: ${ap_ip}
+      subnet: 255.255.255.0
+
+  # Подключение к домашней сети закрывает окно настройки
+  on_connect:
+    - lambda: |-
+        if (prov::is_home_network("${prov_ssid}")) {
+          ui::close_window();
+          ui::set_status("Подключено к домашней сети");
+        }
+
+  reboot_timeout: 15min
+
+# Встроенный web_server ESPHome отключён: страницу даёт lib/ui_server.h на порту 80.
+# Home Assistant пока не подключаем, работаем автономно.
+
+globals:
+  - id: role_selected
+    type: bool
+    initial_value: "false"
+  - id: role_idle_scans
+    type: int
+    initial_value: "0"
+
+interval:
+  - interval: 200ms
+    then:
+      - lambda: |-
+          ui::run_pending();   // команды и тесты с веб-страницы
+
+script:
+  - id: pick_role
+    then:
+      # Случайная задержка без блокировки основного цикла (иначе срабатывает watchdog)
+      - delay: !lambda 'return esp_random() % 10000;'
+      - while:
+          condition:
+            lambda: return !id(role_selected);
+          then:
+            - lambda: |-
+                std::string saved;
+                uint8_t found[6] = {0};
+                const bool has_saved_sta = netrole::saved_sta(saved);
+                const bool saved_setup_sta = has_saved_sta && saved == "${prov_ssid}";
+                if (has_saved_sta && !saved_setup_sta) {
+                  ESP_LOGI("role", "STA config exists: ssid=%s; keeping saved connection", saved.c_str());
+                  id(role_selected) = true;
+                } else {
+                  if (saved_setup_sta) {
+                    ESP_LOGI("role", "Saved STA is setup network; checking peer AP instead of assuming connected");
+                  }
+                  if (!netrole::find_bssid("${prov_ssid}", found)) {
+                    if (netrole::own_ap_active()) {
+                      // Своя точка работает, соседа нет: одна повторная проверка
+                      // через 45 с (tie-break при одновременном старте), потом стоп.
+                      if (id(role_idle_scans) >= 1) {
+                        ESP_LOGI("role", "No peer after recheck; staying AP, scanning stopped");
+                        id(role_selected) = true;
+                      } else {
+                        id(role_idle_scans) = 1;
+                        ESP_LOGI("role", "Own AP up, no peer found; one recheck in 45 s");
+                      }
+                    } else {
+                      ESP_LOGI("role", "No peer setup AP found; will scan again");
+                    }
+                  } else if (netrole::should_join_as_client(found)) {
+                    if (saved_setup_sta) {
+                      ESP_LOGI("role", "Peer setup AP selected; existing STA config will connect");
+                      id(role_selected) = true;
+                    } else {
+                      ESP_LOGI("role", "Peer setup AP selected; saving setup network and rebooting as client");
+                      id(wifi_comp)->save_wifi_sta("${prov_ssid}", "${prov_password}");
+                      App.reboot();
+                    }
+                  } else if (saved_setup_sta) {
+                    ESP_LOGI("role", "MAC tie-break selects AP; clearing saved setup STA and staying AP");
+                    const bool cleared = netrole::clear_saved_sta(id(wifi_comp));
+                    ESP_LOGI("role", "saved setup STA cleared=%s", cleared ? "yes" : "no");
+                    id(role_selected) = true;
+                  } else {
+                    ESP_LOGI("role", "Peer setup AP found; MAC rule selects this device as access point");
+                    id(role_selected) = true;
+                  }
+                }
+            - delay: !lambda 'return id(role_selected) ? 0 : (id(role_idle_scans) > 0 ? 45000 : 10000);'
