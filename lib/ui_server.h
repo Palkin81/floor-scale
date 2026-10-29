@@ -29,6 +29,8 @@
 #include "net_role.h"
 
 #include "ui_icons.h"
+#include "esp_ota_ops.h"
+#include "esphome/components/ota/ota_backend_factory.h"
 
 namespace ui {
 
@@ -380,6 +382,7 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <div class="glass list" style="padding:0">
 <button class="net" type="button" data-go="cal"><b>Калибровка</b><span class="v" id="l-cal"></span><svg viewBox="0 0 24 24"><use href="#i-chev"/></svg></button>
 <button class="net" type="button" data-go="cfg"><b>Настройки: экспорт и импорт</b><svg viewBox="0 0 24 24"><use href="#i-chev"/></svg></button>
+<button class="net" type="button" data-go="fw"><b>Обновление прошивки</b><svg viewBox="0 0 24 24"><use href="#i-chev"/></svg></button>
 <button class="net" type="button" data-go="tests"><b>Тесты</b><svg viewBox="0 0 24 24"><use href="#i-chev"/></svg></button>
 </div>
 <div id="install">
@@ -452,6 +455,25 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 </div>
 </div>
 </section>
+<section class="page" id="p-fw">
+<button class="back" type="button" data-go="sys">‹ Система</button>
+<div class="glass list">
+<div class="row"><span class="k">Платформа</span><span class="v" id="fw-chip">—</span></div>
+<div class="row"><span class="k">Сборка</span><span class="v" id="fw-built">—</span></div>
+<div class="row"><span class="k">Раздел</span><span class="v" id="fw-part">—</span></div>
+<div class="row"><span class="k">Макс. размер</span><span class="v" id="fw-max">—</span></div>
+</div>
+<div class="glass card" style="margin-top:14px">
+<p class="hint" style="margin:0 0 10px"><b>Обновление не защищено паролем:</b> любой, кто подключён к сети устройства, может его прошить. Защита будет добавлена позже.</p>
+<p class="hint" style="margin:0 0 14px">Нужен файл для обновления по воздуху (ESPHome: <code>firmware.ota.bin</code>), а не полный образ <code>factory</code>. Файл должен быть собран для этой платы. После записи устройство перезагрузится. Настройки сохраняются.</p>
+<input id="fw-in" type="file" accept=".bin,application/octet-stream" hidden>
+<div class="stack">
+<button class="btn" id="b-fwfile">Выбрать файл прошивки…</button>
+<p class="hint" id="fw-file" style="margin:0"></p>
+<button class="btn dng" id="b-fwgo" disabled>Обновить</button>
+</div>
+</div>
+</section>
 <section class="page" id="p-tests">
 <button class="back" type="button" data-go="sys">‹ Система</button>
 <p class="hint" style="margin:0 0 14px">Каждый тест пишет начало и конец в журнал устройства. Время в строках — внутреннее время устройства, если оно синхронизировано со страницей, иначе — время с запуска.</p>
@@ -484,6 +506,11 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <h3 style="margin:0 0 6px">Данные весов на экране</h3>
 <p class="hint" style="margin:0 0 12px">Пишет, получены ли от весов вес и калибровка, размер ответа и его возраст. Данные считаются свежими, если им меньше 10 с.</p>
 <button class="btn" data-test="peer_data">Проверить данные весов</button>
+</div>
+<div class="glass card">
+<h3 style="margin:0 0 6px">Обновление прошивки</h3>
+<p class="hint" style="margin:0 0 12px">Ничего не записывает. Пишет платформу, разделы запуска и обновления, свободное место и дату сборки.</p>
+<button class="btn" data-test="update">Проверить обновление</button>
 </div>
 <div class="glass card">
 <h3 style="margin:0 0 6px">Экспорт настроек</h3>
@@ -614,8 +641,8 @@ finally{clearTimeout(id)}
 const post=(u,b,ms)=>api(u,b?{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(b)}:{method:'POST'},ms);
 function setBusy(b){busy=b;document.querySelectorAll('.btn,.net').forEach(x=>x.disabled=b)}
 /* ---------- разделы ---------- */
-const pages=['home','net','sys','cal','cfg','tests'];
-const tabOf={cal:'sys',cfg:'sys',tests:'sys'};
+const pages=['home','net','sys','cal','cfg','fw','tests'];
+const tabOf={cal:'sys',cfg:'sys',fw:'sys',tests:'sys'};
 let curPage='';
 function go(p){
 if(!pages.includes(p))p='home';
@@ -625,6 +652,7 @@ const tab=tabOf[p]||p;
 pages.forEach(x=>$('p-'+x).classList.toggle('on',x===p));
 ['home','net','sys'].forEach(x=>$('t-'+x).setAttribute('aria-selected',x===tab));
 scrollTo(0,0);
+if(p==='fw')loadFw();
 }
 const nav=p=>{if(location.hash.slice(1)===p)go(p);else location.hash=p};
 document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>nav(t.dataset.p));
@@ -694,7 +722,7 @@ vis('cal-note',!W);
 if(W)renderCurve(W.curve);else renderCurve('');
 }
 async function refresh(){
-if(document.hidden)return;
+if(document.hidden||uploading)return;
 try{S=await api('/status');offline=0;render(S);syncClock(S);pullEvents().catch(()=>{})}
 catch(e){if(++offline>=2){chip('bad','Нет связи со страницей')}}
 }
@@ -867,6 +895,64 @@ if(f.size>20000){say('Файл слишком большой для файла �
 try{$('i-in').value=await f.text();say('Файл прочитан: '+f.name)}catch(err){say('Не удалось прочитать файл',true)}
 e.target.value='';
 };
+/* ---------- обновление прошивки ---------- */
+let uploading=false,fwInfo=null,fwFile=null;
+async function loadFw(){
+try{
+fwInfo=await api('/update_info');
+txt('fw-chip',fwInfo.chip);txt('fw-built',fwInfo.built||'—');
+txt('fw-part',(fwInfo.running||'?')+' → '+(fwInfo.next||'?'));
+txt('fw-max',fwInfo.max?Math.round(fwInfo.max/1024)+' КБ':'—');
+}catch(e){fwInfo=null;say('Нет связи с устройством')}
+}
+function readHead(f){return new Promise((ok,no)=>{const r=new FileReader();r.onload=()=>ok(new Uint8Array(r.result));r.onerror=()=>no(r.error);r.readAsArrayBuffer(f.slice(0,64))})}
+async function pickFw(e){
+const f=e.target.files&&e.target.files[0];e.target.value='';
+fwFile=null;$('b-fwgo').disabled=true;txt('fw-file','');
+if(!f)return;
+const bad=m=>{txt('fw-file','Файл не подходит: '+m);say('Файл не подходит: '+m,true)};
+if(!/\.bin$/i.test(f.name))return bad('нужен файл .bin');
+if(f.size<65536||f.size>1900000)return bad('размер не похож на прошивку');
+if(fwInfo&&fwInfo.max&&f.size>fwInfo.max)return bad('не помещается в раздел обновления');
+let h;try{h=await readHead(f)}catch(err){return bad('не удалось прочитать')}
+const magic=(h[32]|h[33]<<8|h[34]<<16|h[35]<<24)>>>0;
+if(h[0]!==0xE9||magic!==0xABCD5432)return bad('это не файл для обновления (нужен firmware.ota.bin)');
+const chip=h[12]|h[13]<<8;
+if(fwInfo&&fwInfo.chip_id!==65535&&chip!==fwInfo.chip_id)return bad('собран для другой платы, это устройство: '+fwInfo.chip);
+fwFile=f;txt('fw-file',f.name+' · '+Math.round(f.size/1024)+' КБ');$('b-fwgo').disabled=false;
+}
+function sendFw(f,onp){
+return new Promise((ok,no)=>{
+const x=new XMLHttpRequest();x.open('POST','/update');
+x.setRequestHeader('Content-Type','application/octet-stream');
+x.upload.onprogress=e=>{if(e.lengthComputable)onp(Math.floor(e.loaded*100/e.total))};
+x.onload=()=>{try{ok(JSON.parse(x.responseText))}catch(e){no(new Error('ответ'))}};
+x.onerror=()=>no(new Error('связь'));x.ontimeout=()=>no(new Error('таймаут'));x.timeout=300000;
+x.send(f);
+});
+}
+async function updateFw(){
+if(busy||uploading||!fwFile)return;
+if(!await ask('Обновить прошивку?','Файл '+fwFile.name+' будет записан в устройство, затем оно перезагрузится. Не закрывайте страницу и не отключайте питание. Обновление не защищено паролем.','Обновить',true))return;
+const built=fwInfo?fwInfo.built:'';
+uploading=true;setBusy(true);prog('Обновление прошивки','Отправляем файл: 0%');
+let res=null;
+try{res=await sendFw(fwFile,p=>{$('pg-p').textContent='Отправляем файл: '+p+'%'})}
+catch(e){res=null}
+if(res&&res.ok===false){uploading=false;setBusy(false);closeSheet();say(res.msg||'Ошибка обновления',true);return}
+// Устройство перезагружается: ждём, пока оно ответит с новой датой сборки
+$('pg-p').textContent='Записано, устройство перезагружается…';
+await new Promise(r=>setTimeout(r,6000));
+let done=false;
+for(let i=0;i<28&&!done;i++){
+try{const j=await api('/update_info',null,3000);if(j.built&&j.built!==built)done=true}catch(e){}
+if(!done)await new Promise(r=>setTimeout(r,2500));
+}
+uploading=false;setBusy(false);closeSheet();
+if(done){say('Прошивка обновлена',true);fwFile=null;$('b-fwgo').disabled=true;txt('fw-file','');loadFw();refresh()}
+else say(res&&res.ok?'Устройство не ответило за 90 с: подождите и обновите страницу':'Связь прервалась. Проверьте, что устройство работает, и обновите страницу',true);
+}
+$('b-fwfile').onclick=()=>$('fw-in').click();$('fw-in').onchange=pickFw;$('b-fwgo').onclick=updateFw;
 $('b-open').onclick=openWin;$('b-reset').onclick=resetNet;$('b-scan').onclick=scan;$('b-reboot').onclick=rebootIt;
 document.querySelectorAll('[data-test]').forEach(b=>b.onclick=()=>runTest(b.dataset.test));
 $('b-zero').onclick=zeroIt;$('b-calib').onclick=calibIt;$('b-curve').onclick=curveReset;
@@ -1373,6 +1459,181 @@ static esp_err_t reply_err(httpd_req_t *req, const std::string &m) {
 }
 
 // Экран пересылает команды калибровки весам. Адрес берём у проверки связи.
+// ---- Обновление прошивки из файла ----
+// Запись идёт через тот же загрузчик, что у родного OTA ESPHome (esphome::ota::make_ota_backend):
+// он стирает и пишет раздел обновления, проверяет образ в end() и переключает загрузку только после успеха.
+// Защиты паролем пока нет (решение пользователя 2026-10-28); страница предупреждает об этом.
+inline volatile bool update_busy = false;
+inline uint8_t update_buf[4096];
+
+// Идентификатор чипа в заголовке образа (esp_chip_id_t) и название платформы
+inline uint16_t expected_chip_id() {
+#if defined(CONFIG_IDF_TARGET_ESP32C6)
+  return 13;
+#elif defined(CONFIG_IDF_TARGET_ESP32C3)
+  return 5;
+#elif defined(CONFIG_IDF_TARGET_ESP32S3)
+  return 9;
+#elif defined(CONFIG_IDF_TARGET_ESP32S2)
+  return 2;
+#elif defined(CONFIG_IDF_TARGET_ESP32)
+  return 0;
+#else
+  return 0xFFFF;
+#endif
+}
+inline const char *chip_name() {
+#if defined(CONFIG_IDF_TARGET_ESP32C6)
+  return "ESP32-C6";
+#elif defined(CONFIG_IDF_TARGET_ESP32C3)
+  return "ESP32-C3";
+#elif defined(CONFIG_IDF_TARGET_ESP32S3)
+  return "ESP32-S3";
+#elif defined(CONFIG_IDF_TARGET_ESP32S2)
+  return "ESP32-S2";
+#elif defined(CONFIG_IDF_TARGET_ESP32)
+  return "ESP32";
+#else
+  return "неизвестно";
+#endif
+}
+
+struct UpdateInfo {
+  std::string running, next, name, date, time;
+  uint32_t max = 0;
+};
+inline UpdateInfo read_update_info() {
+  UpdateInfo u;
+  const esp_partition_t *run = esp_ota_get_running_partition();
+  const esp_partition_t *next = esp_ota_get_next_update_partition(nullptr);
+  if (run != nullptr) {
+    u.running = run->label;
+    esp_app_desc_t d = {};
+    if (esp_ota_get_partition_description(run, &d) == ESP_OK) {
+      u.name = d.project_name;
+      u.date = d.date;
+      u.time = d.time;
+    }
+  }
+  if (next != nullptr) {
+    u.next = next->label;
+    u.max = next->size;
+  }
+  return u;
+}
+
+static esp_err_t h_update_info(httpd_req_t *req) {
+  const UpdateInfo u = read_update_info();
+  char head[64];
+  snprintf(head, sizeof(head), "{\"chip_id\":%u,\"max\":%lu,", (unsigned) expected_chip_id(), (unsigned long) u.max);
+  std::string r = head;
+  r += "\"chip\":\"" + json_escape(chip_name()) + "\",\"running\":\"" + json_escape(u.running.c_str()) +
+       "\",\"next\":\"" + json_escape(u.next.c_str()) + "\",\"name\":\"" + json_escape(u.name.c_str()) +
+       "\",\"built\":\"" + json_escape((u.date + " " + u.time).c_str()) + "\",\"busy\":" +
+       (update_busy ? "true" : "false") + "}";
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  return httpd_resp_send(req, r.c_str(), r.size());
+}
+
+static const char *update_error_text(int code) {
+  switch (code) {
+    case 0x81: return "Не удалось начать обновление";
+    case 0x83: return "Ошибка записи во флеш";
+    case 0x84: return "Записанный образ не прошёл проверку";
+    case 0x89: return "Образ не помещается в раздел обновления";
+    case 0x8A: return "Нет раздела для обновления";
+    case 0x8B: return "Контрольная сумма не совпала";
+    case 0x8D: return "Неверная подпись образа";
+    case 0x93: return "Нельзя установить более старую версию";
+    default: return "Ошибка обновления";
+  }
+}
+
+// Читает кусок тела запроса; короткие таймауты сети переживаем несколькими повторами
+inline int update_recv(httpd_req_t *req, size_t want) {
+  for (int tries = 0; tries < 5; tries++) {
+    const int r = httpd_req_recv(req, (char *) update_buf, want);
+    if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+    return r;
+  }
+  return -1;
+}
+
+static esp_err_t h_update(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  if (update_busy) return reply_err(req, "Обновление уже выполняется");
+  const size_t total = req->content_len;
+  if (total < 65536 || total > 1900000) return reply_err(req, "Размер файла не похож на прошивку");
+  update_busy = true;
+  size_t got = 0;
+  // После ошибки дочитываем тело запроса, иначе браузер увидит обрыв вместо нашего сообщения
+  auto fail = [&](const std::string &msg) {
+    while (got < total) {
+      const size_t want = total - got < sizeof(update_buf) ? total - got : sizeof(update_buf);
+      const int r = update_recv(req, want);
+      if (r <= 0) break;
+      got += (size_t) r;
+    }
+    evlog('e', "Обновление: %s", msg.c_str());
+    update_busy = false;
+    return reply_err(req, msg);
+  };
+
+  int r = update_recv(req, sizeof(update_buf) < total ? sizeof(update_buf) : total);
+  if (r < 64) {
+    update_busy = false;
+    return reply_err(req, "Не удалось прочитать файл");
+  }
+  got = (size_t) r;
+  const uint32_t app_magic = (uint32_t) update_buf[32] | ((uint32_t) update_buf[33] << 8) |
+                             ((uint32_t) update_buf[34] << 16) | ((uint32_t) update_buf[35] << 24);
+  if (update_buf[0] != 0xE9 || app_magic != 0xABCD5432UL)
+    return fail("Это не образ прошивки для обновления: нужен файл OTA, а не полный образ");
+  const uint16_t chip = (uint16_t) update_buf[12] | ((uint16_t) update_buf[13] << 8);
+  if (expected_chip_id() != 0xFFFF && chip != expected_chip_id())
+    return fail(std::string("Прошивка для другой платы, это устройство: ") + chip_name());
+
+  auto backend = esphome::ota::make_ota_backend();
+  if (!backend) return fail("Не удалось подготовить обновление");
+  evlog('i', "Обновление: приём файла %lu байт", (unsigned long) total);
+  esphome::ota::OTAResponseTypes code = backend->begin(total);
+  if (code != esphome::ota::OTA_RESPONSE_OK) return fail(update_error_text((int) code));
+  code = backend->write(update_buf, (size_t) r);
+  if (code != esphome::ota::OTA_RESPONSE_OK) {
+    backend->abort();
+    return fail(update_error_text((int) code));
+  }
+  int next_mark = 25;
+  while (got < total) {
+    const size_t want = total - got < sizeof(update_buf) ? total - got : sizeof(update_buf);
+    r = update_recv(req, want);
+    if (r <= 0) {
+      backend->abort();
+      evlog('e', "Обновление прервано: связь оборвалась на %u%%", (unsigned) (got * 100 / total));
+      update_busy = false;
+      return ESP_FAIL;
+    }
+    code = backend->write(update_buf, (size_t) r);
+    if (code != esphome::ota::OTA_RESPONSE_OK) {
+      backend->abort();
+      return fail(update_error_text((int) code));
+    }
+    got += (size_t) r;
+    if ((int) (got * 100 / total) >= next_mark) {
+      evlog('i', "Обновление: получено %d%%", next_mark);
+      next_mark += 25;
+    }
+  }
+  code = backend->end();
+  if (code != esphome::ota::OTA_RESPONSE_OK) return fail(update_error_text((int) code));
+  evlog('i', "Обновление: прошивка записана, перезагрузка");
+  httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"Прошивка записана, устройство перезагружается\"}");
+  vTaskDelay(pdMS_TO_TICKS(600));
+  if (on_reboot) on_reboot();
+  else esp_restart();
+  return ESP_OK;
+}
+
 // Новые события для страницы: GET /events?after=<последний полученный id>
 static esp_err_t h_events(httpd_req_t *req) {
   uint32_t after = 0;
@@ -1685,6 +1946,7 @@ static const char *test_label(const std::string &n) {
   if (n == "test_peer") return "проверка соседа";
   if (n == "test_peer_data") return "данные весов на экране";
   if (n == "test_export") return "экспорт настроек";
+  if (n == "test_update") return "проверка обновления прошивки";
   if (n == "test_tiebreak") return "тай-брейк: сброс обоих";
   return nullptr;
 }
@@ -1746,6 +2008,14 @@ static void test_task(void *arg) {
                have ? "есть" : "нет", (unsigned) size, (unsigned long) age);
       set_status(have && age < 10000 ? "Данные весов свежие" : "Данных весов нет или они устарели");
     }
+  } else if (self == "test_update") {
+    const UpdateInfo u = read_update_info();
+    evlog('i', "[%s] обновление: платформа %s (chip_id %u); запущено из %s, следующий раздел %s, место %lu байт",
+          clock_stamp().c_str(), chip_name(), (unsigned) expected_chip_id(), u.running.c_str(), u.next.c_str(),
+          (unsigned long) u.max);
+    evlog('i', "[%s] обновление: сборка %s %s, проект %s, загрузка сейчас %s", clock_stamp().c_str(),
+          u.date.c_str(), u.time.c_str(), u.name.c_str(), update_busy ? "идёт" : "не идёт");
+    set_status(u.max > 0 ? "Обновление возможно: раздел найден" : "Нет раздела для обновления");
   } else if (self == "test_export") {
     bool net = false, cal = false;
     const std::string plain = settings_plain(&net, &cal);
@@ -1960,6 +2230,12 @@ inline void start(int port) {
   u.uri = "/test"; u.method = HTTP_POST; u.handler = h_test;
   reg_uri(srv, u);
 
+  u = {};
+  u.uri = "/update"; u.method = HTTP_POST; u.handler = h_update;
+  reg_uri(srv, u);
+  u = {};
+  u.uri = "/update_info"; u.method = HTTP_GET; u.handler = h_update_info;
+  reg_uri(srv, u);
   u = {};
   u.uri = "/events"; u.method = HTTP_GET; u.handler = h_events;
   reg_uri(srv, u);
