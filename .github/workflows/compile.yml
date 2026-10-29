@@ -121,7 +121,7 @@ jobs:
           for f in floor-scale screen_stub; do
             (cd old && esphome config $f.yaml > ../$f.old.txt 2>&1)
             (cd new && esphome config $f.yaml > ../$f.new.txt 2>&1)
-            diff -u $f.old.txt $f.new.txt > $f.diff
+            diff -u $f.old.txt $f.new.txt > $f.diff || true
             n=$(grep -c '^[+-][^+-]' $f.diff || true)
             msg=$(head -c 3500 $f.diff | esc)
             echo "::notice title=Различия $f.yaml: ${n} строк::${msg}"
