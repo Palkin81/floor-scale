@@ -50,6 +50,12 @@ esphome:
 esp32:
   framework:
     type: esp-idf
+    # Наш http-сервер ESPHome при расчёте сокетов не учитывает (по умолчанию 10 на всё):
+    # страницы, опрос соседа, API и панель упираются в предел (в логе «error in accept (23)»,
+    # «Failed to create socket»). Поднимаем общий пул сокетов и число TCP-соединений.
+    sdkconfig_options:
+      CONFIG_LWIP_MAX_SOCKETS: "16"
+      CONFIG_LWIP_MAX_ACTIVE_TCP: "24"
     advanced:
       include_builtin_idf_components:
         - esp_http_server
