@@ -51,9 +51,6 @@ inline std::string setup_ssid;
 // Версия протокола обмена между устройствами (поле proto в /peer_identity и /status).
 // Растёт при несовместимых изменениях; устройство без поля считается версией 0.
 inline constexpr int kProto = 1;
-// Общий адрес точки доступа настройки у всех устройств: в сети настройки точкой в каждый момент
-// является одно устройство, клиент обращается к шлюзу своей сети.
-inline constexpr const char *kApIp = "192.168.4.1";
 inline int peer_proto = -1;                 // версия протокола соседа по последнему ответу, -1 = нет данных
 inline std::string peer_host;
 inline std::function<void(const std::string &, const std::string &)> on_creds;
@@ -1057,7 +1054,9 @@ inline std::string local_role(std::string *connected_ssid = nullptr) {
   return "Ожидание сети";
 }
 
-// Адрес точки доступа соседа, когда мы клиент её сети: это шлюз нашей сети. Запасной вариант — общий адрес.
+// Адрес точки доступа соседа, когда мы клиент её сети: это шлюз нашей сети (пусто, если не подключены).
+// Адреса собственных точек у устройств ДОЛЖНЫ различаться: при одинаковом адресе ответы клиента
+// соседу маршрутизируются на собственный интерфейс точки и пропадают (см. снимок, 12.4a).
 inline std::string peer_ap_ip_now() {
   esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
   esp_netif_ip_info_t info = {};
@@ -1066,7 +1065,7 @@ inline std::string peer_ap_ip_now() {
     snprintf(v, sizeof(v), IPSTR, IP2STR(&info.gw));
     return v;
   }
-  return kApIp;
+  return "";
 }
 
 inline std::string own_mac_text() {
@@ -1164,7 +1163,7 @@ inline bool probe_peer(std::string &peer_role) {
   const std::string role = local_role();
   if (role == "Клиент (слейв)") {
     const std::string ap = peer_ap_ip_now();
-    if (!read_identity(ap, expected, peer_role)) return false;
+    if (ap.empty() || !read_identity(ap, expected, peer_role)) return false;
     probe_ip = ap;
     return true;
   }
@@ -1988,7 +1987,9 @@ inline bool reset_peer_now() {
   std::string sta_ssid;
   const bool setup_client = netrole::saved_sta(sta_ssid) && setup_ssid.size() > 0 &&
       sta_ssid == setup_ssid;
-  return setup_client ? prov_link::reset_peer_at(peer_ap_ip_now()) : prov_link::reset_ap_clients();
+  if (!setup_client) return prov_link::reset_ap_clients();
+  const std::string ap = peer_ap_ip_now();
+  return !ap.empty() && prov_link::reset_peer_at(ap);
 }
 
 // Метка «после сброса»: переживает перезагрузку (NVS), чтобы после загрузки записать итог роли
