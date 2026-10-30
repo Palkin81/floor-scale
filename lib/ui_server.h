@@ -31,6 +31,8 @@
 
 #include "ui_icons.h"
 #include "esp_ota_ops.h"
+#include "esp_heap_caps.h"
+#include "lwip/sockets.h"
 #include "esphome/core/application.h"
 #include "esphome/components/ota/ota_backend_factory.h"
 
@@ -508,6 +510,11 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <h3 style="margin:0 0 6px">Данные весов на экране</h3>
 <p class="hint" style="margin:0 0 12px">Пишет, получены ли от весов вес и калибровка, размер ответа и его возраст. Данные считаются свежими, если им меньше 10 с.</p>
 <button class="btn" data-test="peer_data">Проверить данные весов</button>
+</div>
+<div class="glass card">
+<h3 style="margin:0 0 6px">Ресурсы: память и сокеты</h3>
+<p class="hint" style="margin:0 0 12px">Пишет число занятых сетевых сокетов (из пула), свободную память и минимум свободной памяти с запуска. Нажимайте после 10–15 минут работы и при пропаже связи.</p>
+<button class="btn" data-test="resources">Проверить ресурсы</button>
 </div>
 <div class="glass card">
 <h3 style="margin:0 0 6px">Обновление прошивки</h3>
@@ -1955,6 +1962,7 @@ static const char *test_label(const std::string &n) {
   if (n == "test_peer_data") return "данные весов на экране";
   if (n == "test_export") return "экспорт настроек";
   if (n == "test_update") return "проверка обновления прошивки";
+  if (n == "test_resources") return "ресурсы: память и сокеты";
   if (n == "test_tiebreak") return "тай-брейк: сброс обоих";
   return nullptr;
 }
@@ -2016,6 +2024,32 @@ static void test_task(void *arg) {
                have ? "есть" : "нет", (unsigned) size, (unsigned long) age);
       set_status(have && age < 10000 ? "Данные весов свежие" : "Данных весов нет или они устарели");
     }
+  } else if (self == "test_resources") {
+    // Занятые сокеты считаем перебором дескрипторов пула LWIP: getsockopt успешен только у открытых
+    int tcp_conn = 0, tcp_listen = 0, udp = 0, other = 0;
+    for (int fd = LWIP_SOCKET_OFFSET; fd < LWIP_SOCKET_OFFSET + CONFIG_LWIP_MAX_SOCKETS; fd++) {
+      int type = 0;
+      socklen_t len = sizeof(type);
+      if (lwip_getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) != 0) continue;
+      if (type == SOCK_STREAM) {
+        int lis = 0;
+        len = sizeof(lis);
+        if (lwip_getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &lis, &len) == 0 && lis) tcp_listen++;
+        else tcp_conn++;
+      } else if (type == SOCK_DGRAM) {
+        udp++;
+      } else {
+        other++;
+      }
+    }
+    const int used = tcp_conn + tcp_listen + udp + other;
+    evlog('i', "[%s] сокеты: занято %d из %d (TCP-соединений %d, слушающих %d, UDP %d)", clock_stamp().c_str(),
+          used, (int) CONFIG_LWIP_MAX_SOCKETS, tcp_conn, tcp_listen, udp);
+    evlog('i', "[%s] память: свободно %u байт, минимум с запуска %u, самый большой блок %u", clock_stamp().c_str(),
+          (unsigned) esp_get_free_heap_size(), (unsigned) esp_get_minimum_free_heap_size(),
+          (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    evlog('i', "[%s] работа: %lu с с запуска", clock_stamp().c_str(), (unsigned long) (now_ms() / 1000));
+    set_status(used >= CONFIG_LWIP_MAX_SOCKETS - 1 ? "Сокеты почти исчерпаны" : "Ресурсы в норме");
   } else if (self == "test_update") {
     const UpdateInfo u = read_update_info();
     evlog('i', "[%s] обновление: платформа %s (chip_id %u), запущено из %s, следующий раздел %s",
