@@ -14,7 +14,7 @@ substitutions:
   off_delay_ms: "10000"
   boot_zero_tol_kg: "2.0"    # макс. расхождение нового и сохранённого нуля при старте
   boot_zero_jitter_kg: "0.5" # макс. разброс при старте, чтобы ноль считался стабильным
-  ap_ip: "192.168.4.10"      # адрес собственной точки доступа
+  ap_ip: "192.168.4.1"      # общий адрес точки (проверка варианта C, см. снимок)
 
 packages:
   common: !include packages/common.yaml
@@ -27,7 +27,6 @@ script:
   - id: device_setup
     then:
       - lambda: |-
-          ui::peer_ap_ip = "192.168.4.11";
           ui::peer_host = "floor-screen.local";
           ui::device_kind = "scale";
           ui::device_title = "Весы";
