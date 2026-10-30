@@ -1068,6 +1068,28 @@ inline std::string peer_ap_ip_now() {
   return "";
 }
 
+// Снимок сетевого состояния для разбора потерь связи: режим Wi-Fi, интерфейс собственной точки
+// и интерфейс клиента (адрес, шлюз, поднят ли). Нужен, чтобы увидеть, не поднята ли у клиента своя точка.
+inline std::string net_snapshot() {
+  wifi_mode_t mode = WIFI_MODE_NULL;
+  esp_wifi_get_mode(&mode);
+  const char *mode_s = mode == WIFI_MODE_AP ? "AP" : mode == WIFI_MODE_STA ? "STA" : mode == WIFI_MODE_APSTA ? "APSTA" : "нет";
+  auto one = [](const char *key, std::string &out) {
+    esp_netif_t *n = esp_netif_get_handle_from_ifkey(key);
+    if (n == nullptr) { out = "нет интерфейса"; return; }
+    esp_netif_ip_info_t i = {};
+    esp_netif_get_ip_info(n, &i);
+    char b[80];
+    snprintf(b, sizeof(b), "%s " IPSTR " шлюз " IPSTR, esp_netif_is_netif_up(n) ? "поднят" : "выключен",
+             IP2STR(&i.ip), IP2STR(&i.gw));
+    out = b;
+  };
+  std::string ap, sta;
+  one("WIFI_AP_DEF", ap);
+  one("WIFI_STA_DEF", sta);
+  return std::string("режим ") + mode_s + "; точка: " + ap + "; клиент: " + sta;
+}
+
 inline std::string own_mac_text() {
   uint8_t m[6] = {0};
   esp_read_mac(m, ESP_MAC_WIFI_STA);
@@ -1269,8 +1291,10 @@ inline void peer_monitor_task(void *) {
     }
     if (!keep_state && applicable) {
       static bool prev_known = false, prev_linked = false;
-      if (!prev_known || linked != prev_linked)
+      if (!prev_known || linked != prev_linked) {
         evlog(linked ? 'i' : 'w', "Связь с соседом: %s", linked ? "есть" : "потеряна");
+        evlog('i', "Сеть: %s", net_snapshot().c_str());
+      }
       prev_known = true;
       prev_linked = linked;
     }
@@ -2069,6 +2093,7 @@ static void test_task(void *arg) {
     evlog('i', "[%s] своя точка активна: %s; сохранённая сеть: %s; связь с соседом: %s",
              clock_stamp().c_str(), netrole::own_ap_active() ? "да" : "нет",
              has_saved ? saved.c_str() : "нет", peer_link_state ? "да" : "нет");
+    evlog('i', "[%s] сеть: %s", clock_stamp().c_str(), net_snapshot().c_str());
     set_status("Состояние роли записано в журнал");
   } else if (self == "test_scan") {
     uint8_t bssid[6] = {0};
