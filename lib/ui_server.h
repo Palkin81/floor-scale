@@ -30,6 +30,8 @@
 #include "net_role.h"
 
 #include "ui_icons.h"
+#include "esp_mac.h"
+#include "esp_netif.h"
 #include "esp_ota_ops.h"
 #include "esp_heap_caps.h"
 #include "lwip/sockets.h"
@@ -46,7 +48,13 @@ inline uint32_t window_until = 0;           // до какого момента 
 inline char status_buf[160] = "Ожидание";
 inline std::string prov_key;                // base64 ключ, задаётся из YAML
 inline std::string setup_ssid;
-inline std::string peer_ap_ip;
+// Версия протокола обмена между устройствами (поле proto в /peer_identity и /status).
+// Растёт при несовместимых изменениях; устройство без поля считается версией 0.
+inline constexpr int kProto = 1;
+// Общий адрес точки доступа настройки у всех устройств: в сети настройки точкой в каждый момент
+// является одно устройство, клиент обращается к шлюзу своей сети.
+inline constexpr const char *kApIp = "192.168.4.1";
+inline int peer_proto = -1;                 // версия протокола соседа по последнему ответу, -1 = нет данных
 inline std::string peer_host;
 inline std::function<void(const std::string &, const std::string &)> on_creds;
 inline std::function<void()> on_reset;
@@ -1049,12 +1057,77 @@ inline std::string local_role(std::string *connected_ssid = nullptr) {
   return "Ожидание сети";
 }
 
+// Адрес точки доступа соседа, когда мы клиент её сети: это шлюз нашей сети. Запасной вариант — общий адрес.
+inline std::string peer_ap_ip_now() {
+  esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  esp_netif_ip_info_t info = {};
+  if (sta != nullptr && esp_netif_get_ip_info(sta, &info) == ESP_OK && info.gw.addr != 0) {
+    char v[16];
+    snprintf(v, sizeof(v), IPSTR, IP2STR(&info.gw));
+    return v;
+  }
+  return kApIp;
+}
+
+inline std::string own_mac_text() {
+  uint8_t m[6] = {0};
+  esp_read_mac(m, ESP_MAC_WIFI_STA);
+  char t[18];
+  snprintf(t, sizeof(t), "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
+  return t;
+}
+
+// Сервис mDNS _floorscale._tcp: по нему соседа находят в домашней сети без зашитых имён хостов.
+// TXT: kind (вид устройства), proto (версия протокола), mac (STA, чтобы не принять самого себя).
+// Регистрируем при первой возможности (mDNS поднимает ESPHome, раньше он может быть не готов).
+inline bool mdns_service_added = false;
+inline void announce_service() {
+  if (mdns_service_added) return;
+  static std::string mac = own_mac_text();
+  static std::string proto = std::to_string(kProto);
+  mdns_txt_item_t txt[3] = {{"kind", device_kind.c_str()}, {"proto", proto.c_str()}, {"mac", mac.c_str()}};
+  const esp_err_t e = mdns_service_add(nullptr, "_floorscale", "_tcp", 80, txt, 3);
+  if (e == ESP_OK) {
+    mdns_service_added = true;
+    evlog('i', "mDNS: сервис _floorscale._tcp зарегистрирован");
+  }
+}
+
+// Ищет соседа по сервису mDNS, пропуская себя по MAC из TXT
+inline bool find_peer_by_service(std::string &ip) {
+  mdns_result_t *res = nullptr;
+  if (mdns_query_ptr("_floorscale", "_tcp", 1000, 8, &res) != ESP_OK || res == nullptr) return false;
+  const std::string self = own_mac_text();
+  bool found = false;
+  for (mdns_result_t *r = res; r != nullptr && !found; r = r->next) {
+    std::string mac;
+    for (size_t i = 0; i < r->txt_count; i++)
+      if (r->txt[i].key != nullptr && r->txt[i].value != nullptr && strcmp(r->txt[i].key, "mac") == 0)
+        mac = r->txt[i].value;
+    if (mac == self) continue;
+    for (mdns_ip_addr_t *a = r->addr; a != nullptr; a = a->next) {
+      if (a->addr.type != ESP_IPADDR_TYPE_V4) continue;
+      char v[16];
+      snprintf(v, sizeof(v), IPSTR, IP2STR(&a->addr.u_addr.ip4));
+      ip = v;
+      found = true;
+      break;
+    }
+  }
+  mdns_query_results_free(res);
+  return found;
+}
+
 inline bool read_identity(const std::string &ip, const std::string &expected_kind,
                           std::string &role) {
   std::string response;
   if (!prov_link::get_request("http://" + ip + "/peer_identity", response, 1500)) return false;
   const std::string kind_field = "\"kind\":\"" + expected_kind + "\"";
   if (response.find(kind_field) == std::string::npos) return false;
+  {
+    const size_t pp = response.find("\"proto\":");
+    peer_proto = pp == std::string::npos ? 0 : atoi(response.c_str() + pp + 8);
+  }
   const std::string key = "\"role\":\"";
   size_t pos = response.find(key);
   if (pos != std::string::npos) {
@@ -1090,8 +1163,9 @@ inline bool probe_peer(std::string &peer_role) {
   const std::string expected = device_kind == "scale" ? "screen" : "scale";
   const std::string role = local_role();
   if (role == "Клиент (слейв)") {
-    if (peer_ap_ip.empty() || !read_identity(peer_ap_ip, expected, peer_role)) return false;
-    probe_ip = peer_ap_ip;
+    const std::string ap = peer_ap_ip_now();
+    if (!read_identity(ap, expected, peer_role)) return false;
+    probe_ip = ap;
     return true;
   }
   if (role == "Домашняя сеть") {
@@ -1101,7 +1175,9 @@ inline bool probe_peer(std::string &peer_role) {
       return true;
     }
     std::string ip;
-    if (resolve_peer_host(ip) && read_identity(ip, expected, peer_role)) {
+    // Сначала поиск по сервису (не зависит от имени хоста), потом по имени хоста
+    if (((find_peer_by_service(ip) && read_identity(ip, expected, peer_role)) ||
+         (resolve_peer_host(ip) && read_identity(ip, expected, peer_role)))) {
       home_peer_ip = ip;
       probe_ip = ip;
       return true;
@@ -1164,7 +1240,15 @@ inline void peer_monitor_task(void *) {
     const bool applicable = own_role == "Клиент (слейв)" ||
                             own_role == "Точка доступа (мастер)" ||
                             own_role == "Домашняя сеть";
+    announce_service();
     const bool linked = applicable && probe_peer(role);
+    {
+      static int warned_proto = -2;
+      if (linked && peer_proto >= 0 && peer_proto != kProto && peer_proto != warned_proto) {
+        evlog('w', "Версия протокола соседа %d, у нас %d: обновите прошивку на втором устройстве", peer_proto, kProto);
+        warned_proto = peer_proto;
+      }
+    }
     // Одиночный пропуск (потерянный пакет, занятый сосед) не должен сбрасывать связь:
     // раньше из-за этого одно устройство видело соседа, а другое нет. Состояние
     // «нет связи» ставим после трёх подряд неудачных проверок.
@@ -1226,8 +1310,8 @@ inline void peer_data_task(void *) {
 }
 
 inline std::string identity_json() {
-  return "{\"kind\":\"" + device_kind + "\",\"role\":\"" +
-         json_escape(local_role().c_str()) + "\"}";
+  return "{\"kind\":\"" + device_kind + "\",\"proto\":" + std::to_string(kProto) + ",\"mac\":\"" +
+         own_mac_text() + "\",\"role\":\"" + json_escape(local_role().c_str()) + "\"}";
 }
 
 // Состояние сети и отдельная проверка доступности именно второго устройства.
@@ -1260,6 +1344,8 @@ inline std::string status_json() {
   const long long clock_now = clock_set_at ? (long long) time(nullptr) : 0;
   out += ",\"clock_ts\":" + std::to_string(clock_now);
   out += ",\"kind\":\"" + device_kind + "\"";
+  out += ",\"proto\":" + std::to_string(kProto);
+  out += ",\"mac\":\"" + own_mac_text() + "\"";
   out += ",\"title\":\"" + json_escape(device_title.c_str()) + "\"";
   bool checked = false, applicable = false, linked = false;
   char peer_role[sizeof(peer_role_buf)] = "";
@@ -1870,7 +1956,7 @@ static esp_err_t h_connect(httpd_req_t *req) {
     }
 
     const bool sent = was_setup_client
-        ? prov_link::send_to_peer_ap(peer_ap_ip, blob)
+        ? prov_link::send_to_peer_ap(peer_ap_ip_now(), blob)
         : prov_link::send_to_ap_clients(blob);
     if (!sent) {
       set_status("Сеть проверена, сосед не принял настройки");
@@ -1902,7 +1988,7 @@ inline bool reset_peer_now() {
   std::string sta_ssid;
   const bool setup_client = netrole::saved_sta(sta_ssid) && setup_ssid.size() > 0 &&
       sta_ssid == setup_ssid;
-  return setup_client ? prov_link::reset_peer_at(peer_ap_ip) : prov_link::reset_ap_clients();
+  return setup_client ? prov_link::reset_peer_at(peer_ap_ip_now()) : prov_link::reset_ap_clients();
 }
 
 // Метка «после сброса»: переживает перезагрузку (NVS), чтобы после загрузки записать итог роли
@@ -1990,7 +2076,7 @@ static void test_task(void *arg) {
              found ? "найдена" : "не найдена");
     set_status(found ? "Скан: точка настройки найдена" : "Скан: точка настройки не найдена");
   } else if (self == "test_peer") {
-    const std::string hosts[2] = {peer_ap_ip, peer_host};
+    const std::string hosts[2] = {peer_ap_ip_now(), peer_host};
     for (const std::string &host : hosts) {
       if (host.empty()) continue;
       std::string resp;
@@ -2000,6 +2086,14 @@ static void test_task(void *arg) {
       evlog('i', "[%s] сосед %s: %s, %u байт, %lu мс", clock_stamp().c_str(), host.c_str(),
                ok ? "ответил" : "не ответил", (unsigned) resp.size(),
                (unsigned long) (now_ms() - t0));
+    }
+    {
+      std::string svc_ip;
+      const uint32_t t1 = now_ms();
+      const bool svc = find_peer_by_service(svc_ip);
+      evlog('i', "[%s] сервис _floorscale._tcp: %s%s%s, %lu мс; зарегистрирован у себя: %s; протокол соседа: %d (у нас %d)",
+            clock_stamp().c_str(), svc ? "найден " : "не найден", "", svc ? svc_ip.c_str() : "",
+            (unsigned long) (now_ms() - t1), mdns_service_added ? "да" : "нет", peer_proto, kProto);
     }
     std::string known_ip;
     evlog('i', "[%s] адрес соседа из проверки связи: %s; кэш домашней сети: %s; пропусков подряд: %d",

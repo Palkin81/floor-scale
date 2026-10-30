@@ -1,5 +1,5 @@
 substitutions:
-  ap_ip: "192.168.4.11"      # адрес собственной точки доступа
+  ap_ip: "192.168.4.1"      # общий адрес точки доступа у обоих устройств
 
 packages:
   common: !include packages/common.yaml
@@ -12,7 +12,6 @@ script:
   - id: device_setup
     then:
       - lambda: |-
-          ui::peer_ap_ip = "192.168.4.10";
           ui::peer_host = "floor-scale.local";
 
 esp32:
