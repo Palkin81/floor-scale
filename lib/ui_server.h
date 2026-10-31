@@ -2068,6 +2068,24 @@ static esp_err_t h_import(httpd_req_t *req) {
 }
 
 // Проверка сети и передача зашифрованных учётных данных соседу.
+// Отправка зашифрованной сети соседу, когда мы мастер точки. Раньше пробовали всех клиентов DHCP подряд
+// (включая телефон, по ~4 с на каждого), а после проверки сети радио переключается и сосед на несколько секунд
+// пропадает: первая попытка падала. Теперь: адрес соседа из его hello, до 4 попыток с паузой, затем прежний перебор.
+inline bool send_creds_to_neighbor(const std::string &blob) {
+  const std::string expected = device_kind == "scale" ? "screen" : "scale";
+  for (int attempt = 0; attempt < 4; attempt++) {
+    std::string role, ip;
+    if (hello_lookup(expected, role, ip)) {
+      if (prov_link::post_blob(ip, blob)) return true;
+      evlog('w', "Сосед %s не принял сеть с попытки %d, повтор через 3 с", ip.c_str(), attempt + 1);
+    } else {
+      evlog('w', "Сосед не представлялся, ждём его возвращения (попытка %d)", attempt + 1);
+    }
+    vTaskDelay(pdMS_TO_TICKS(3000));
+  }
+  return prov_link::send_to_ap_clients(blob);
+}
+
 static esp_err_t h_connect(httpd_req_t *req) {
   std::string b;
   httpd_resp_set_type(req, "application/json; charset=utf-8");
@@ -2101,7 +2119,7 @@ static esp_err_t h_connect(httpd_req_t *req) {
 
     const bool sent = was_setup_client
         ? prov_link::send_to_peer_ap(peer_ap_ip_now(), blob)
-        : prov_link::send_to_ap_clients(blob);
+        : send_creds_to_neighbor(blob);
     if (!sent) {
       set_status("Сеть проверена, сосед не принял настройки");
       return httpd_resp_sendstr(req,
