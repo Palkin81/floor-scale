@@ -1139,10 +1139,10 @@ inline bool find_peer_by_service(std::string &ip) {
   return found;
 }
 
-inline bool read_identity(const std::string &ip, const std::string &expected_kind,
-                          std::string &role) {
-  std::string response;
-  if (!prov_link::get_request("http://" + ip + "/peer_identity", response, 1500)) return false;
+inline std::string identity_json();  // определена ниже
+
+// Разбор ответа/запроса вида {"kind":..,"proto":..,"mac":..,"role":..}: kind должен совпасть
+inline bool identity_ok(const std::string &response, const std::string &expected_kind, std::string &role) {
   const std::string kind_field = "\"kind\":\"" + expected_kind + "\"";
   if (response.find(kind_field) == std::string::npos) return false;
   {
@@ -1157,6 +1157,48 @@ inline bool read_identity(const std::string &ip, const std::string &expected_kin
     if (end != std::string::npos) role = response.substr(pos, end - pos);
   }
   return true;
+}
+
+// hello=true: вместо GET /peer_identity шлём POST /hello со своим представлением; в ответе представление
+// соседа. Так сосед (мастер точки) узнаёт клиента без перебора клиентов DHCP.
+inline bool read_identity(const std::string &ip, const std::string &expected_kind, std::string &role,
+                          bool hello = false) {
+  std::string response;
+  if (hello) {
+    if (!prov_link::post_text("http://" + ip + "/hello", identity_json(), response, "application/json", 1500))
+      return false;
+  } else if (!prov_link::get_request("http://" + ip + "/peer_identity", response, 1500)) {
+    return false;
+  }
+  return identity_ok(response, expected_kind, role);
+}
+
+// Последний сосед, представившийся через POST /hello (пишет httpd, читает peer_monitor; под peer_status_lock)
+struct HelloPeer {
+  char ip[16] = "";
+  char kind[12] = "";
+  char role[48] = "";
+  char mac[18] = "";
+  int proto = 0;
+  uint32_t at = 0;
+  bool valid = false;
+};
+inline HelloPeer hello_peer;
+inline constexpr uint32_t kHelloFreshMs = 20000;  // клиент шлёт hello каждые ~5 с
+
+inline bool hello_lookup(const std::string &expected_kind, std::string &role, std::string &ip) {
+  bool ok = false;
+  if (peer_status_lock != nullptr && xSemaphoreTake(peer_status_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (hello_peer.valid && expected_kind == hello_peer.kind &&
+        (uint32_t) (now_ms() - hello_peer.at) < kHelloFreshMs) {
+      role = hello_peer.role;
+      ip = hello_peer.ip;
+      peer_proto = hello_peer.proto;
+      ok = true;
+    }
+    xSemaphoreGive(peer_status_lock);
+  }
+  return ok;
 }
 
 inline bool resolve_peer_host(std::string &ip) {
@@ -1185,7 +1227,7 @@ inline bool probe_peer(std::string &peer_role) {
   const std::string role = local_role();
   if (role == "Клиент (слейв)") {
     const std::string ap = peer_ap_ip_now();
-    if (ap.empty() || !read_identity(ap, expected, peer_role)) return false;
+    if (ap.empty() || !read_identity(ap, expected, peer_role, true)) return false;
     probe_ip = ap;
     return true;
   }
@@ -1208,7 +1250,16 @@ inline bool probe_peer(std::string &peer_role) {
   }
   if (role != "Точка доступа (мастер)") return false;
 
-  // В режиме мастера ищем именно веб-морду второго устройства среди клиентов
+  // Мастер: сначала сосед, который сам представился (POST /hello от клиента). Старые прошивки
+  // не представляются, для них остаётся перебор клиентов DHCP ниже.
+  {
+    std::string hip;
+    if (hello_lookup(expected, peer_role, hip)) {
+      probe_ip = hip;
+      return true;
+    }
+  }
+  // Ищем именно веб-морду второго устройства среди клиентов
   // DHCP, чтобы телефон, подключённый к той же AP, не считался соседом.
   wifi_sta_list_t stations = {};
   if (esp_wifi_ap_get_sta_list(&stations) != ESP_OK || stations.num == 0) return false;
@@ -1447,6 +1498,76 @@ static esp_err_t h_status(httpd_req_t *req) {
 }
 
 static esp_err_t h_peer_identity(httpd_req_t *req) {
+  const std::string s = identity_json();
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_send(req, s.c_str(), s.size());
+}
+
+// Адрес отправителя запроса (IPv4, в том числе в виде IPv4-mapped IPv6)
+static bool request_peer_ip(httpd_req_t *req, char out[16]) {
+  const int fd = httpd_req_to_sockfd(req);
+  if (fd < 0) return false;
+  struct sockaddr_storage ss = {};
+  socklen_t len = sizeof(ss);
+  if (getpeername(fd, (struct sockaddr *) &ss, &len) != 0) return false;
+  if (ss.ss_family == AF_INET) {
+    const struct sockaddr_in *a = (const struct sockaddr_in *) &ss;
+    const uint8_t *b = (const uint8_t *) &a->sin_addr.s_addr;
+    snprintf(out, 16, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+    return true;
+  }
+#if LWIP_IPV6
+  if (ss.ss_family == AF_INET6) {
+    const struct sockaddr_in6 *a = (const struct sockaddr_in6 *) &ss;
+    const uint8_t *b = (const uint8_t *) &a->sin6_addr;
+    for (int i = 0; i < 10; i++)
+      if (b[i] != 0) return false;
+    if (b[10] != 0xff || b[11] != 0xff) return false;
+    snprintf(out, 16, "%u.%u.%u.%u", b[12], b[13], b[14], b[15]);
+    return true;
+  }
+#endif
+  return false;
+}
+
+// POST /hello: сосед присылает своё представление, в ответ наше. Запоминаем его вместе с адресом отправителя.
+static esp_err_t h_hello(httpd_req_t *req) {
+  char buf[256];
+  int n = req->content_len < (int) sizeof(buf) - 1 ? (int) req->content_len : (int) sizeof(buf) - 1;
+  int got = 0;
+  while (got < n) {
+    const int r = httpd_req_recv(req, buf + got, n - got);
+    if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+    if (r <= 0) break;
+    got += r;
+  }
+  buf[got] = '\0';
+  const std::string body = buf;
+  auto field = [&](const char *key) -> std::string {
+    const std::string k = std::string("\"") + key + "\":\"";
+    size_t p = body.find(k);
+    if (p == std::string::npos) return "";
+    p += k.size();
+    const size_t e = body.find('"', p);
+    return e == std::string::npos ? "" : body.substr(p, e - p);
+  };
+  const std::string kind = field("kind"), role = field("role"), mac = field("mac");
+  const size_t pp = body.find("\"proto\":");
+  const int proto = pp == std::string::npos ? 0 : atoi(body.c_str() + pp + 8);
+  char ip[16] = "";
+  if (!kind.empty() && kind.size() < sizeof(hello_peer.kind) && request_peer_ip(req, ip) &&
+      peer_status_lock != nullptr && xSemaphoreTake(peer_status_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+    const bool changed = !hello_peer.valid || mac != hello_peer.mac || kind != hello_peer.kind;
+    snprintf(hello_peer.ip, sizeof(hello_peer.ip), "%s", ip);
+    snprintf(hello_peer.kind, sizeof(hello_peer.kind), "%s", kind.c_str());
+    snprintf(hello_peer.role, sizeof(hello_peer.role), "%s", role.c_str());
+    snprintf(hello_peer.mac, sizeof(hello_peer.mac), "%s", mac.c_str());
+    hello_peer.proto = proto;
+    hello_peer.at = now_ms();
+    hello_peer.valid = true;
+    xSemaphoreGive(peer_status_lock);
+    if (changed) evlog('i', "Сосед представился: %s %s, %s, протокол %d", kind.c_str(), mac.c_str(), ip, proto);
+  }
   const std::string s = identity_json();
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, s.c_str(), s.size());
@@ -2121,6 +2242,18 @@ static void test_task(void *arg) {
             clock_stamp().c_str(), svc ? "найден " : "не найден", "", svc ? svc_ip.c_str() : "",
             (unsigned long) (now_ms() - t1), mdns_service_added ? "да" : "нет", peer_proto, kProto);
     }
+    {
+      HelloPeer h;
+      if (peer_status_lock != nullptr && xSemaphoreTake(peer_status_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        h = hello_peer;
+        xSemaphoreGive(peer_status_lock);
+      }
+      if (h.valid)
+        evlog('i', "[%s] hello от соседа: %s %s, %s, %lu мс назад", clock_stamp().c_str(), h.kind, h.mac, h.ip,
+              (unsigned long) (now_ms() - h.at));
+      else
+        evlog('i', "[%s] hello от соседа: не получали", clock_stamp().c_str());
+    }
     std::string known_ip;
     evlog('i', "[%s] адрес соседа из проверки связи: %s; кэш домашней сети: %s; пропусков подряд: %d",
              clock_stamp().c_str(), peer_ip_now(known_ip) ? known_ip.c_str() : "нет",
@@ -2341,6 +2474,9 @@ inline void start(int port) {
 
   u = {};
   u.uri = "/peer_identity"; u.method = HTTP_GET; u.handler = h_peer_identity;
+  reg_uri(srv, u);
+  u = {};
+  u.uri = "/hello"; u.method = HTTP_POST; u.handler = h_hello;
   reg_uri(srv, u);
 
   if (peer_status_lock == nullptr) peer_status_lock = xSemaphoreCreateMutex();
