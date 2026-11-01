@@ -14,6 +14,7 @@ substitutions:
 
 esphome:
   includes:
+    - lib/blackbox.h
     - lib/prov_crypto.h
     - lib/prov_link.h
     - lib/wifi_probe.h
@@ -24,16 +25,19 @@ esphome:
     priority: -100
     then:
       - lambda: |-
+          bb::begin();
           netrole::start_logging();
           ui::prov_key = "${prov_key_b64}";
           ui::setup_ssid = "${prov_ssid}";
           ui::on_reset = []() {
             const bool cleared = netrole::clear_saved_sta(id(wifi_comp));
             ESP_LOGI("reset", "persistent Wi-Fi credentials cleared=%s", cleared ? "yes" : "no");
+            bb::key("RST", "saved sta cleared=%d, rebooting", cleared ? 1 : 0);
             App.reboot();
           };
           ui::on_reboot = []() { App.reboot(); };
           ui::on_creds = [](const std::string &ssid, const std::string &pass) {
+            bb::key("RST", "saving new sta creds, rebooting");
             id(wifi_comp)->save_wifi_sta(ssid, pass);
             delay(1000);
             App.reboot();
@@ -65,6 +69,10 @@ logger:
   level: INFO
   logs:
     component: ERROR
+    # Noise: timeouts of our own neighbour polling. The black box (lib/blackbox.h) records link state instead.
+    esp-tls: NONE
+    transport_base: NONE
+    HTTP_CLIENT: NONE
 
 api:
   # Без Home Assistant клиентов устройство по умолчанию перезагружается каждые
@@ -138,10 +146,12 @@ script:
                 const bool saved_setup_sta = has_saved_sta && saved == "${prov_ssid}";
                 if (has_saved_sta && !saved_setup_sta) {
                   ESP_LOGI("role", "STA config exists: ssid=%s; keeping saved connection", saved.c_str());
+                  bb::key("ROLE", "keep saved home sta");
                   id(role_selected) = true;
                 } else {
                   if (saved_setup_sta) {
                     ESP_LOGI("role", "Saved STA is setup network; checking peer AP instead of assuming connected");
+                    bb::key("ROLE", "saved sta is setup net, checking peer");
                   }
                   if (!netrole::find_bssid("${prov_ssid}", found)) {
                     if (netrole::own_ap_active()) {
@@ -149,10 +159,12 @@ script:
                       // через 45 с (tie-break при одновременном старте), потом стоп.
                       if (id(role_idle_scans) >= 1) {
                         ESP_LOGI("role", "No peer after recheck; staying AP, scanning stopped");
+                        bb::key("ROLE", "no peer after recheck -> AP, scan stopped");
                         id(role_selected) = true;
                       } else {
                         id(role_idle_scans) = 1;
                         ESP_LOGI("role", "Own AP up, no peer found; one recheck in 45 s");
+                        bb::line("ROLE", "own AP up, no peer, recheck in 45s");
                       }
                     } else {
                       ESP_LOGI("role", "No peer setup AP found; will scan again");
@@ -160,19 +172,23 @@ script:
                   } else if (netrole::should_join_as_client(found)) {
                     if (saved_setup_sta) {
                       ESP_LOGI("role", "Peer setup AP selected; existing STA config will connect");
+                      bb::key("ROLE", "peer AP found -> CLIENT (saved sta)");
                       id(role_selected) = true;
                     } else {
                       ESP_LOGI("role", "Peer setup AP selected; saving setup network and rebooting as client");
+                      bb::key("ROLE", "peer AP found -> CLIENT, saving setup net, reboot");
                       id(wifi_comp)->save_wifi_sta("${prov_ssid}", "${prov_password}");
                       App.reboot();
                     }
                   } else if (saved_setup_sta) {
                     ESP_LOGI("role", "MAC tie-break selects AP; clearing saved setup STA and staying AP");
+                    bb::key("ROLE", "tiebreak -> AP, clearing saved setup sta");
                     const bool cleared = netrole::clear_saved_sta(id(wifi_comp));
                     ESP_LOGI("role", "saved setup STA cleared=%s", cleared ? "yes" : "no");
                     id(role_selected) = true;
                   } else {
                     ESP_LOGI("role", "Peer setup AP found; MAC rule selects this device as access point");
+                    bb::key("ROLE", "peer AP found, tiebreak -> AP");
                     id(role_selected) = true;
                   }
                 }

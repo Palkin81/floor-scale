@@ -77,6 +77,7 @@ inline void wifi_event_log(void *, esp_event_base_t base, int32_t id, void *data
   if (base == WIFI_EVENT) {
     if (id == WIFI_EVENT_STA_START) {
       ESP_LOGI(TAG_NR, "STA started");
+      bb::line("WIFI", "sta_start");
     } else if (id == WIFI_EVENT_AP_START) {
       own_ap_started.store(true);
       wifi_config_t cfg = {};
@@ -89,6 +90,7 @@ inline void wifi_event_log(void *, esp_event_base_t base, int32_t id, void *data
       mac_text(mac, mac_s);
       ESP_LOGI(TAG_NR, "AP started: ssid=%s mac=%s channel=%u",
                ssid, mac_s, (unsigned) cfg.ap.channel);
+      bb::key("WIFI", "ap_start ch=%u mac=%s", (unsigned) cfg.ap.channel, mac_s);
     } else if (id == WIFI_EVENT_STA_CONNECTED && data != nullptr) {
       auto *ev = static_cast<wifi_event_sta_connected_t *>(data);
       char ssid[33] = {0};
@@ -97,6 +99,8 @@ inline void wifi_event_log(void *, esp_event_base_t base, int32_t id, void *data
       mac_text(ev->bssid, mac);
       ESP_LOGI(TAG_NR, "STA connected: ssid=%s bssid=%s channel=%u",
                ssid, mac, (unsigned) ev->channel);
+      bb::key("WIFI", "sta_conn net=%s bssid=%s ch=%u", strncmp(ssid, "scale_setup", 11) == 0 ? "setup" : "home",
+              mac, (unsigned) ev->channel);
     } else if (id == WIFI_EVENT_STA_DISCONNECTED && data != nullptr) {
       auto *ev = static_cast<wifi_event_sta_disconnected_t *>(data);
       char ssid[33] = {0};
@@ -105,22 +109,27 @@ inline void wifi_event_log(void *, esp_event_base_t base, int32_t id, void *data
       mac_text(ev->bssid, mac);
       ESP_LOGW(TAG_NR, "STA disconnected: ssid=%s bssid=%s reason=%u",
                ssid, mac, (unsigned) ev->reason);
+      bb::key("WIFI", "sta_disc net=%s reason=%u", strncmp(ssid, "scale_setup", 11) == 0 ? "setup" : "home",
+              (unsigned) ev->reason);
     } else if (id == WIFI_EVENT_AP_STACONNECTED && data != nullptr) {
       auto *ev = static_cast<wifi_event_ap_staconnected_t *>(data);
       char mac[18];
       mac_text(ev->mac, mac);
       ap_join_ms = (uint32_t) (esp_timer_get_time() / 1000);
       ESP_LOGI(TAG_NR, "AP client connected: mac=%s aid=%u", mac, (unsigned) ev->aid);
+      bb::key("WIFI", "ap_cli_join mac=%s aid=%u", mac, (unsigned) ev->aid);
     } else if (id == WIFI_EVENT_AP_STADISCONNECTED && data != nullptr) {
       auto *ev = static_cast<wifi_event_ap_stadisconnected_t *>(data);
       char mac[18];
       mac_text(ev->mac, mac);
       ESP_LOGW(TAG_NR, "AP client disconnected: mac=%s aid=%u", mac, (unsigned) ev->aid);
+      bb::key("WIFI", "ap_cli_leave mac=%s aid=%u", mac, (unsigned) ev->aid);
     }
   } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP && data != nullptr) {
     auto *ev = static_cast<ip_event_got_ip_t *>(data);
     ESP_LOGI(TAG_NR, "STA got IP: " IPSTR " gateway=" IPSTR,
              IP2STR(&ev->ip_info.ip), IP2STR(&ev->ip_info.gw));
+    bb::key("WIFI", "got_ip " IPSTR " gw " IPSTR, IP2STR(&ev->ip_info.ip), IP2STR(&ev->ip_info.gw));
   }
 }
 

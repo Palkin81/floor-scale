@@ -487,6 +487,13 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <button class="back" type="button" data-go="sys">‹ Система</button>
 <p class="hint" style="margin:0 0 14px">Каждый тест пишет начало и конец в журнал устройства. Время в строках — внутреннее время устройства, если оно синхронизировано со страницей, иначе — время с запуска.</p>
 <div class="glass card">
+<h3 style="margin:0 0 6px">Чёрный ящик</h3>
+<p class="hint" style="margin:0 0 12px">Компактный журнал хранится в памяти устройства и переживает перезагрузки. Скачайте оба файла и передайте для разбора. Журнал соседа берётся через эту страницу, пока есть связь.</p>
+<a class="btn" style="display:flex;align-items:center;justify-content:center;text-decoration:none;margin-bottom:10px" href="/bb" download>Скачать журнал этого устройства</a>
+<a class="btn" style="display:flex;align-items:center;justify-content:center;text-decoration:none;margin-bottom:10px" href="/bb_peer" download>Скачать журнал соседа</a>
+<button class="btn dng" id="bb-clear" type="button">Очистить журнал этого устройства</button>
+</div>
+<div class="glass card">
 <h3 style="margin:0 0 6px">Маркер в журнал</h3>
 <p class="hint" style="margin:0 0 12px">Записывает отметку в журнал. Нажмите перед нужным действием, чтобы найти момент в логе.</p>
 <button class="btn" data-test="marker">Записать маркер</button>
@@ -969,6 +976,10 @@ else say(res&&res.ok?'Устройство не ответило за 90 с: п�
 $('b-fwfile').onclick=()=>$('fw-in').click();$('fw-in').onchange=pickFw;$('b-fwgo').onclick=updateFw;
 $('b-open').onclick=openWin;$('b-reset').onclick=resetNet;$('b-scan').onclick=scan;$('b-reboot').onclick=rebootIt;
 document.querySelectorAll('[data-test]').forEach(b=>b.onclick=()=>runTest(b.dataset.test));
+$('bb-clear').onclick=async()=>{
+if(!await ask('Очистить журнал?','Будет стёрт журнал этого устройства. Перед новым тестом это нормально.','Очистить',true))return;
+try{const j=await post('/bb_clear');say(j.msg||'Журнал очищен')}catch(e){say('Нет связи с устройством')}
+};
 $('b-zero').onclick=zeroIt;$('b-calib').onclick=calibIt;$('b-curve').onclick=curveReset;
 go(location.hash.slice(1));renderEv();refresh();
 setInterval(refresh,5000);
@@ -1088,6 +1099,31 @@ inline std::string net_snapshot() {
   one("WIFI_AP_DEF", ap);
   one("WIFI_STA_DEF", sta);
   return std::string("режим ") + mode_s + "; точка: " + ap + "; клиент: " + sta;
+}
+
+// ASCII-only codes for the black box (the page text is Russian, the log must not be).
+inline const char *role_code() {
+  const std::string r = local_role();
+  if (r == "Клиент (слейв)") return "CLIENT";
+  if (r == "Домашняя сеть") return "HOME";
+  if (r == "Точка доступа (мастер)") return "AP";
+  return "WAIT";
+}
+
+inline std::string net_code() {
+  wifi_mode_t mode = WIFI_MODE_NULL;
+  esp_wifi_get_mode(&mode);
+  const char *m = mode == WIFI_MODE_AP ? "AP" : mode == WIFI_MODE_STA ? "STA" : mode == WIFI_MODE_APSTA ? "APSTA" : "none";
+  auto one = [](const char *key) {
+    esp_netif_t *n = esp_netif_get_handle_from_ifkey(key);
+    if (n == nullptr) return std::string("-");
+    esp_netif_ip_info_t i = {};
+    esp_netif_get_ip_info(n, &i);
+    char b[48];
+    snprintf(b, sizeof(b), "%s/" IPSTR "/gw" IPSTR, esp_netif_is_netif_up(n) ? "up" : "down", IP2STR(&i.ip), IP2STR(&i.gw));
+    return std::string(b);
+  };
+  return std::string("mode=") + m + " ap=" + one("WIFI_AP_DEF") + " sta=" + one("WIFI_STA_DEF");
 }
 
 inline std::string own_mac_text() {
@@ -1345,6 +1381,8 @@ inline void peer_monitor_task(void *) {
       if (!prev_known || linked != prev_linked) {
         evlog(linked ? 'i' : 'w', "Связь с соседом: %s", linked ? "есть" : "потеряна");
         evlog('i', "Сеть: %s", net_snapshot().c_str());
+        bb::key("LINK", "%s role=%s peer=%s %s", linked ? "up" : "DOWN", role_code(),
+                linked ? probe_ip.c_str() : "-", net_code().c_str());
       }
       prev_known = true;
       prev_linked = linked;
@@ -1567,6 +1605,7 @@ static esp_err_t h_hello(httpd_req_t *req) {
     hello_peer.valid = true;
     xSemaphoreGive(peer_status_lock);
     if (changed) evlog('i', "Сосед представился: %s %s, %s, протокол %d", kind.c_str(), mac.c_str(), ip, proto);
+    if (changed) bb::key("HELLO", "from kind=%s mac=%s ip=%s proto=%d", kind.c_str(), mac.c_str(), ip, proto);
   }
   const std::string s = identity_json();
   httpd_resp_set_type(req, "application/json");
@@ -1820,6 +1859,7 @@ static esp_err_t h_update(httpd_req_t *req) {
       got += (size_t) r;
     }
     evlog('e', "Обновление: %s", msg.c_str());
+    bb::key("UPD", "rejected at %lu/%lu bytes", (unsigned long) got, (unsigned long) total);
     update_busy = false;
     return reply_err(req, msg);
   };
@@ -1841,6 +1881,7 @@ static esp_err_t h_update(httpd_req_t *req) {
   auto backend = esphome::ota::make_ota_backend();
   if (!backend) return fail("Не удалось подготовить обновление");
   evlog('i', "Обновление: приём файла %lu байт", (unsigned long) total);
+  bb::key("UPD", "start size=%lu", (unsigned long) total);
   esphome::ota::OTAResponseTypes code = backend->begin(total);
   if (code != esphome::ota::OTA_RESPONSE_OK) return fail(update_error_text((int) code));
   code = backend->write(update_buf, (size_t) r);
@@ -1855,6 +1896,7 @@ static esp_err_t h_update(httpd_req_t *req) {
     if (r <= 0) {
       backend->abort();
       evlog('e', "Обновление прервано: связь оборвалась на %u%%", (unsigned) (got * 100 / total));
+      bb::key("UPD", "ABORT link lost at %u%%", (unsigned) (got * 100 / total));
       update_busy = false;
       return ESP_FAIL;
     }
@@ -1872,6 +1914,7 @@ static esp_err_t h_update(httpd_req_t *req) {
   code = backend->end();
   if (code != esphome::ota::OTA_RESPONSE_OK) return fail(update_error_text((int) code));
   evlog('i', "Обновление: прошивка записана, перезагрузка");
+  bb::key("UPD", "written ok, reboot");
   httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"Прошивка записана, устройство перезагружается\"}");
   vTaskDelay(pdMS_TO_TICKS(600));
   if (on_reboot) on_reboot();
@@ -2104,7 +2147,11 @@ static esp_err_t h_connect(httpd_req_t *req) {
       sta_ssid == setup_ssid;
 
   bool previous_network_restored = false;
-  if (probe::try_connect(ssid, pass, 15000, &previous_network_restored)) {
+  bb::key("CONN", "request ssid_len=%u pass_len=%u was_setup_client=%d role=%s", (unsigned) ssid.size(),
+          (unsigned) pass.size(), was_setup_client ? 1 : 0, role_code());
+  const bool probe_ok = probe::try_connect(ssid, pass, 15000, &previous_network_restored);
+  bb::key("CONN", "probe ok=%d restored=%d %s", probe_ok ? 1 : 0, previous_network_restored ? 1 : 0, net_code().c_str());
+  if (probe_ok) {
     if (!previous_network_restored) {
       set_status("Сеть проверена, но связь с соседом не восстановилась");
       return httpd_resp_sendstr(req,
@@ -2120,6 +2167,7 @@ static esp_err_t h_connect(httpd_req_t *req) {
     const bool sent = was_setup_client
         ? prov_link::send_to_peer_ap(peer_ap_ip_now(), blob)
         : send_creds_to_neighbor(blob);
+    bb::key("CONN", "send_to_neighbor sent=%d", sent ? 1 : 0);
     if (!sent) {
       set_status("Сеть проверена, сосед не принял настройки");
       return httpd_resp_sendstr(req,
@@ -2183,6 +2231,7 @@ inline void clear_reset_pending() {
 
 static esp_err_t h_reset(httpd_req_t *req) {
   const bool peer_reset = reset_peer_now();
+  bb::key("RST", "network reset from page peer_reset=%d", peer_reset ? 1 : 0);
   mark_reset_pending();
 
   const char *msg = peer_reset
@@ -2222,8 +2271,10 @@ static void test_task(void *arg) {
   const char *label = test_label(name);
   const std::string self = name;
   evlog('i', "[%s] ТЕСТ НАЧАТ: %s", clock_stamp().c_str(), label ? label : self.c_str());
+  bb::key("TEST", "start %s", self.c_str());
   if (self == "test_marker") {
     evlog('i', "[%s] МАРКЕР: отметка для поиска момента в журнале", clock_stamp().c_str());
+    bb::key("MARK", "user marker");
     set_status("Маркер записан в журнал");
   } else if (self == "test_role") {
     std::string saved;
@@ -2350,6 +2401,7 @@ static void test_task(void *arg) {
     if (on_reset) on_reset();  // перезагрузка; итог роли запишется после загрузки
   }
   evlog('i', "[%s] ТЕСТ ЗАВЕРШЁН: %s", clock_stamp().c_str(), label ? label : self.c_str());
+  bb::key("TEST", "end %s", self.c_str());
   free(name);
   test_busy = false;
   vTaskDelete(nullptr);
@@ -2395,6 +2447,7 @@ static esp_err_t h_reboot(httpd_req_t *req) {
   httpd_resp_set_type(req, "application/json; charset=utf-8");
   if (!on_reboot) return reply_msg(req, "Перезагрузка не поддерживается");
   evlog('w', "reboot requested from web page");
+  bb::key("RST", "reboot from page");
   set_status("Перезагрузка по команде со страницы");
   httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"Перезагрузка\"}");
   vTaskDelay(pdMS_TO_TICKS(250));
@@ -2416,11 +2469,13 @@ static esp_err_t h_time(httpd_req_t *req) {
   if (!tz.empty()) clock_tz_min = (int) strtol(tz.c_str(), nullptr, 10);
   clock_set_at = ts;
   evlog('i', "[%s] время задано со страницы", clock_stamp().c_str());
+  bb::key("CLK", "unix=%lld tz_min=%d", ts, clock_tz_min);
   return reply_msg(req, "Время установлено");
 }
 
 // Команда от соседа. Отвечает до сброса и не пересылает команду обратно.
 static esp_err_t h_peer_reset(httpd_req_t *req) {
+  bb::key("RST", "network reset requested by neighbor");
   mark_reset_pending();
   set_status("Сосед запросил сброс сети");
   httpd_resp_set_type(req, "application/json; charset=utf-8");
@@ -2434,6 +2489,7 @@ static esp_err_t h_peer_reset(httpd_req_t *req) {
 static esp_err_t h_prov(httpd_req_t *req) {
   httpd_resp_set_type(req, "application/json; charset=utf-8");
   if (!window_open()) {
+    bb::key("PROV", "rejected: window closed");
     set_status("Окно настройки закрыто. Откройте его кнопкой на странице");
     return httpd_resp_sendstr(req, "{\"ok\":false,\"msg\":\"Окно настройки закрыто\"}");
   }
@@ -2446,11 +2502,83 @@ static esp_err_t h_prov(httpd_req_t *req) {
     set_status("Ошибка: неверный ключ или данные");
     return httpd_resp_sendstr(req, "{\"ok\":false,\"msg\":\"Неверный ключ или данные\"}");
   }
+  bb::key("PROV", "creds received, reboot");
   set_status("Креды приняты, перезагрузка");
   close_window();
   httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"Креды приняты\"}");
   if (on_creds) on_creds(ssid, pass);
   return ESP_OK;
+}
+
+
+// ---- Black box: sampler task and download endpoints ----
+// One compact line every 30 s: memory, role, link, signal. Enough to see trends, not a flood.
+inline void bb_sampler_task(void *) {
+  vTaskDelay(pdMS_TO_TICKS(15000));
+  while (true) {
+    wifi_ap_record_t ap = {};
+    const bool sta = esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+    bool linked = false;
+    char pip[16] = "-";
+    if (peer_status_lock != nullptr && xSemaphoreTake(peer_status_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+      linked = peer_link_state;
+      if (peer_ip_buf[0]) snprintf(pip, sizeof(pip), "%s", peer_ip_buf);
+      xSemaphoreGive(peer_status_lock);
+    }
+    const uint32_t data_age = (device_kind == "screen" && peer_data_at != 0) ? (now_ms() - peer_data_at) / 1000 : 0;
+    bb::line("SAMPLE", "heap=%lu min=%lu blk=%lu role=%s link=%d peer=%s miss=%d rssi=%d dage=%lu win=%d",
+             (unsigned long) esp_get_free_heap_size(), (unsigned long) esp_get_minimum_free_heap_size(),
+             (unsigned long) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), role_code(), linked ? 1 : 0, pip,
+             peer_misses, sta ? (int) ap.rssi : 0, (unsigned long) data_age, window_open() ? 1 : 0);
+    bb::tick();
+    vTaskDelay(pdMS_TO_TICKS(30000));
+  }
+}
+
+static esp_err_t h_bb(httpd_req_t *req) {
+  return bb::dump(req, own_mac_text().c_str());
+}
+
+static esp_err_t h_bb_clear(httpd_req_t *req) {
+  bb::clear();
+  bb::key("MARK", "log cleared by user");
+  return reply_msg(req, "Black box cleared");
+}
+
+// Neighbour's black box, streamed through this device so the page can download both files.
+static esp_err_t h_bb_peer(httpd_req_t *req) {
+  std::string ip;
+  if (!peer_ip_now(ip)) {
+    httpd_resp_set_status(req, "404 Not Found");
+    return httpd_resp_sendstr(req, "peer not linked");
+  }
+  const std::string url = "http://" + ip + "/bb";
+  esp_http_client_config_t cfg = {};
+  cfg.url = url.c_str();
+  cfg.timeout_ms = 4000;
+  esp_http_client_handle_t c = esp_http_client_init(&cfg);
+  if (c == nullptr || esp_http_client_open(c, 0) != ESP_OK) {
+    if (c != nullptr) esp_http_client_cleanup(c);
+    httpd_resp_set_status(req, "502 Bad Gateway");
+    return httpd_resp_sendstr(req, "peer unreachable");
+  }
+  esp_http_client_fetch_headers(c);
+  httpd_resp_set_type(req, "text/plain; charset=us-ascii");
+  httpd_resp_set_hdr(req, "Content-Disposition",
+                     device_kind == "screen" ? "attachment; filename=\"bb-peer-scale.txt\""
+                                             : "attachment; filename=\"bb-peer-screen.txt\"");
+  char *buf = (char *) malloc(1024);
+  if (buf != nullptr) {
+    while (true) {
+      const int n = esp_http_client_read(c, buf, 1024);
+      if (n <= 0) break;
+      if (httpd_resp_send_chunk(req, buf, n) != ESP_OK) break;
+    }
+    free(buf);
+  }
+  esp_http_client_close(c);
+  esp_http_client_cleanup(c);
+  return httpd_resp_send_chunk(req, nullptr, 0);
 }
 
 // Регистрация маршрута с проверкой результата: при переполнении таблицы
@@ -2464,10 +2592,21 @@ inline void reg_uri(httpd_handle_t srv, const httpd_uri_t &u) {
 }
 
 inline void start(int port) {
+  bb::kind = device_kind;
+  {
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    esp_app_desc_t d = {};
+    if (run != nullptr && esp_ota_get_partition_description(run, &d) == ESP_OK) {
+      char hex[9];
+      for (int i = 0; i < 4; i++) snprintf(hex + i * 2, 3, "%02x", d.app_elf_sha256[i]);
+      bb::build = hex;
+    }
+  }
+  bb::key("START", "http server kind=%s proto=%d", device_kind.c_str(), kProto);
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port = port;
   // По умолчанию 8 обработчиков; у нас 12 маршрутов, лишние тихо отбрасывались (404)
-  cfg.max_uri_handlers = 28;
+  cfg.max_uri_handlers = 32;
   // Сокетов в системе мало (общий пул LWIP): страницы, опрос соседа, API ESPHome и панель делят его.
   // При нехватке закрываем самое давнее неактивное соединение вместо отказа новым (accept error 23).
   cfg.lru_purge_enable = true;
@@ -2504,6 +2643,17 @@ inline void start(int port) {
   } else {
     evlog('e', "cannot create peer status mutex");
   }
+
+  u = {};
+  u.uri = "/bb"; u.method = HTTP_GET; u.handler = h_bb;
+  reg_uri(srv, u);
+  u = {};
+  u.uri = "/bb_peer"; u.method = HTTP_GET; u.handler = h_bb_peer;
+  reg_uri(srv, u);
+  u = {};
+  u.uri = "/bb_clear"; u.method = HTTP_POST; u.handler = h_bb_clear;
+  reg_uri(srv, u);
+  xTaskCreate(bb_sampler_task, "bb_sample", 4096, nullptr, 1, nullptr);
 
   u = {};
   u.uri = "/scan"; u.method = HTTP_GET; u.handler = h_scan;
