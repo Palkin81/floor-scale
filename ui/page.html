@@ -308,6 +308,13 @@ h2{margin:24px 8px 10px;font-size:13px;font-weight:600;letter-spacing:.06em;text
   <button class="back" type="button" data-go="sys">‹ Система</button>
   <p class="hint" style="margin:0 0 14px">Каждый тест пишет начало и конец в журнал устройства. Время в строках — внутреннее время устройства, если оно синхронизировано со страницей, иначе — время с запуска.</p>
   <div class="glass card">
+    <h3 style="margin:0 0 6px">Чёрный ящик</h3>
+    <p class="hint" style="margin:0 0 12px">Компактный журнал хранится в памяти устройства и переживает перезагрузки. Скачайте оба файла и передайте для разбора. Журнал соседа берётся через эту страницу, пока есть связь.</p>
+    <a class="btn" style="display:flex;align-items:center;justify-content:center;text-decoration:none;margin-bottom:10px" href="/bb" download>Скачать журнал этого устройства</a>
+    <a class="btn" style="display:flex;align-items:center;justify-content:center;text-decoration:none;margin-bottom:10px" href="/bb_peer" download>Скачать журнал соседа</a>
+    <button class="btn dng" id="bb-clear" type="button">Очистить журнал этого устройства</button>
+  </div>
+  <div class="glass card">
     <h3 style="margin:0 0 6px">Маркер в журнал</h3>
     <p class="hint" style="margin:0 0 12px">Записывает отметку в журнал. Нажмите перед нужным действием, чтобы найти момент в логе.</p>
     <button class="btn" data-test="marker">Записать маркер</button>
@@ -804,6 +811,10 @@ $('b-fwfile').onclick=()=>$('fw-in').click();$('fw-in').onchange=pickFw;$('b-fwg
 
 $('b-open').onclick=openWin;$('b-reset').onclick=resetNet;$('b-scan').onclick=scan;$('b-reboot').onclick=rebootIt;
 document.querySelectorAll('[data-test]').forEach(b=>b.onclick=()=>runTest(b.dataset.test));
+$('bb-clear').onclick=async()=>{
+  if(!await ask('Очистить журнал?','Будет стёрт журнал этого устройства. Перед новым тестом это нормально.','Очистить',true))return;
+  try{const j=await post('/bb_clear');say(j.msg||'Журнал очищен')}catch(e){say('Нет связи с устройством')}
+};
 $('b-zero').onclick=zeroIt;$('b-calib').onclick=calibIt;$('b-curve').onclick=curveReset;
 
 go(location.hash.slice(1));renderEv();refresh();
