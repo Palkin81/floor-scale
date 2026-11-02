@@ -308,6 +308,13 @@ h2{margin:24px 8px 10px;font-size:13px;font-weight:600;letter-spacing:.06em;text
   <button class="back" type="button" data-go="sys">‹ Система</button>
   <p class="hint" style="margin:0 0 14px">Каждый тест пишет начало и конец в журнал устройства. Время в строках — внутреннее время устройства, если оно синхронизировано со страницей, иначе — время с запуска.</p>
   <div class="glass card">
+    <h3 style="margin:0 0 6px">Полный тест</h3>
+    <p class="hint" style="margin:0 0 12px">Оба устройства сами проходят проверки в текущей сети (около 1,5 минуты), затем ждут, пока вы подключите их к домашней сети в разделе «Сеть», и повторяют проверки там. Всё пишется в журнал чёрного ящика: после завершения скачайте журналы обоих устройств. Запускайте, когда устройства видят друг друга.</p>
+    <div class="hint" id="ft-state" style="margin:0 0 12px;font-weight:600">Тест не запущен</div>
+    <button class="btn pri" id="ft-start" type="button" style="margin-bottom:10px">Запустить полный тест</button>
+    <button class="btn dng" id="ft-cancel" type="button">Остановить тест</button>
+  </div>
+  <div class="glass card">
     <h3 style="margin:0 0 6px">Чёрный ящик</h3>
     <p class="hint" style="margin:0 0 12px">Компактный журнал хранится в памяти устройства и переживает перезагрузки. Скачайте оба файла и передайте для разбора. Журнал соседа берётся через эту страницу, пока есть связь.</p>
     <a class="btn" style="display:flex;align-items:center;justify-content:center;text-decoration:none;margin-bottom:10px" href="/bb" download>Скачать журнал этого устройства</a>
@@ -530,6 +537,8 @@ function renderCurve(s){
 }
 function render(j){
   isScale=j.kind==='scale';
+  {const ft=j.ft|0,m=['Тест не запущен','Идёт этап A (текущая сеть), около 1,5 минуты','Этап A готов. Подключите оба устройства к домашней сети в разделе «Сеть»: тест продолжится сам','Идёт этап B (домашняя сеть), около 1,5 минуты'];
+  txt('ft-state',m[ft]||m[0]);$('ft-start').disabled=ft!==0||!j.peer_link;$('ft-cancel').disabled=ft===0;}
   W=isScale?j:(j.scale||null);
   if(!ready){ready=true;go(location.hash.slice(1))}
   const title=j.title||'Floor Scale';txt('title',title);if(document.title!==title)document.title=title;
@@ -810,6 +819,13 @@ $('b-fwfile').onclick=()=>$('fw-in').click();$('fw-in').onchange=pickFw;$('b-fwg
 
 $('b-open').onclick=openWin;$('b-reset').onclick=resetNet;$('b-scan').onclick=scan;$('b-reboot').onclick=rebootIt;
 document.querySelectorAll('[data-test]').forEach(b=>b.onclick=()=>runTest(b.dataset.test));
+$('ft-start').onclick=async()=>{
+  if(!await ask('Запустить полный тест?','Оба устройства пройдут проверки и запишут результат в журнал. Во время теста не перезагружайте их и не меняйте сеть, пока не появится просьба.','Запустить',false))return;
+  try{const j=await post('/ft_start');say(j.msg||'Тест запущен',true)}catch(e){say('Нет связи с устройством')}
+};
+$('ft-cancel').onclick=async()=>{
+  try{const j=await post('/ft_cancel');say(j.msg||'Тест остановлен')}catch(e){say('Нет связи с устройством')}
+};
 $('bb-clear').onclick=async()=>{
   if(!await ask('Очистить журнал?','Будет стёрт журнал этого устройства. Перед новым тестом это нормально.','Очистить',true))return;
   try{const j=await post('/bb_clear');say(j.msg||'Журнал очищен')}catch(e){say('Нет связи с устройством')}

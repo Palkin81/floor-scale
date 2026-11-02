@@ -22,6 +22,9 @@ inline bool logging_started = false;
 // True only after ESP-IDF confirms our fallback AP is actually running.
 // Before that, a peer AP is already established and should be preferred.
 inline std::atomic_bool own_ap_started{false};
+// Event counters for the full test (deltas over a test window)
+inline std::atomic<uint32_t> ev_sta_disc{0};
+inline std::atomic<uint32_t> ev_ap_leave{0};
 // Время (мс) последнего подключения клиента к нашей точке. Кэш «не сосед» старше этого
 // момента не действует: переподключившееся устройство проверяется заново.
 inline volatile uint32_t ap_join_ms = 0;
@@ -109,6 +112,7 @@ inline void wifi_event_log(void *, esp_event_base_t base, int32_t id, void *data
       mac_text(ev->bssid, mac);
       ESP_LOGW(TAG_NR, "STA disconnected: ssid=%s bssid=%s reason=%u",
                ssid, mac, (unsigned) ev->reason);
+      ev_sta_disc++;
       bb::key("WIFI", "sta_disc net=%s reason=%u", strncmp(ssid, "scale_setup", 11) == 0 ? "setup" : "home",
               (unsigned) ev->reason);
     } else if (id == WIFI_EVENT_AP_STACONNECTED && data != nullptr) {
@@ -123,6 +127,7 @@ inline void wifi_event_log(void *, esp_event_base_t base, int32_t id, void *data
       char mac[18];
       mac_text(ev->mac, mac);
       ESP_LOGW(TAG_NR, "AP client disconnected: mac=%s aid=%u", mac, (unsigned) ev->aid);
+      ev_ap_leave++;
       bb::key("WIFI", "ap_cli_leave mac=%s aid=%u", mac, (unsigned) ev->aid);
     }
   } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP && data != nullptr) {
