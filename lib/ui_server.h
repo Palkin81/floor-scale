@@ -92,6 +92,7 @@ inline char peer_ip_buf[16] = "";
 inline std::string home_peer_ip;           // последний рабочий адрес соседа в домашней сети
 inline std::string peer_data;              // последний ответ /status соседа (только экран)
 inline uint32_t peer_data_at = 0;          // когда получен, мс
+inline volatile int ft_phase = 0;          // полный тест: 0 нет, 1 этап A, 2 ждём домашнюю сеть, 3 этап B
 inline uint32_t link_down_total = 0;       // сколько раз связь с соседом была потеряна (для полного теста)
 inline int peer_misses = 0;                // подряд пропущенных проверок связи
 
@@ -2574,7 +2575,6 @@ static esp_err_t h_prov(httpd_req_t *req) {
 // to connect both devices to the home network (state kept in NVS across the reboot), then phase B
 // repeats the same checks at home. Everything goes to the black box with tag FT.
 // ft_phase: 0 idle, 1 running A, 2 waiting for home network, 3 running B.
-inline volatile int ft_phase = 0;
 inline int sockets_in_use() {
   int used = 0;
   for (int fd = LWIP_SOCKET_OFFSET; fd < LWIP_SOCKET_OFFSET + CONFIG_LWIP_MAX_SOCKETS; fd++) {
