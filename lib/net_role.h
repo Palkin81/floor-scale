@@ -237,6 +237,7 @@ inline bool own_ap_active() {
 // If our fallback AP has not started yet, the discovered peer is already
 // established: join it regardless of MAC. Use MAC only to break the tie when
 // both devices independently started their fallback APs before seeing each other.
+inline constexpr uint32_t kNewcomerS = 30;
 inline bool should_join_as_client(const uint8_t found[6]) {
   if (!own_ap_active()) {
     char peer_s[18];
@@ -251,7 +252,18 @@ inline bool should_join_as_client(const uint8_t found[6]) {
   char own_s[18], peer_s[18];
   mac_text(own, own_s);
   mac_text(found, peer_s);
+  // Devices are equal: whoever raised the network first is the master. A device without a saved
+  // network raises its own AP right at boot, so "own AP is up" alone does not mean "I was first".
+  // Young device (booted < 30 s ago) that sees a peer AP is the newcomer: it joins, MAC is not used.
+  // MAC breaks the tie only when we have been up longer (both fallback APs raised around the same time).
+  const uint32_t up_s = (uint32_t) (esp_timer_get_time() / 1000000);
+  if (up_s < kNewcomerS) {
+    ESP_LOGI(TAG_NR, "peer AP %s was there first (we are %lus old) -> STA client", peer_s, (unsigned long) up_s);
+    bb::key("ROLE", "newcomer up=%lus sees peer AP %s -> client (no MAC)", (unsigned long) up_s, peer_s);
+    return true;
+  }
   const bool join = memcmp(own, found, 6) > 0;
+  bb::key("ROLE", "tie-break up=%lus own=%s peer=%s -> %s", (unsigned long) up_s, own_s, peer_s, join ? "client" : "AP");
   ESP_LOGI(TAG_NR, "both APs started; MAC tie-break: own=%s peer=%s -> %s",
            own_s, peer_s, join ? "STA client" : "AP");
   return join;
