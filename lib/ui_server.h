@@ -521,7 +521,7 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <div class="glass card" id="tc-pd" hidden>
 <h3 style="margin:0 0 6px">Данные весов на экране</h3>
 <p class="hint" style="margin:0 0 12px">Пишет, получены ли от весов вес и калибровка, размер ответа и его возраст. Данные считаются свежими, если им меньше 10 с.</p>
-<button class="btn" data-test="peer_data">Проверить данные весов</button>
+<button class="btn" data-test="peer_data">Проверить данные соседа</button>
 </div>
 <div class="glass card">
 <h3 style="margin:0 0 6px">Ресурсы: память и сокеты</h3>
@@ -1257,13 +1257,15 @@ inline bool resolve_peer_host(std::string &ip) {
 inline constexpr uint32_t kNonPeerRecheckMs = 600000;
 
 inline std::string probe_ip;  // адрес, по которому последний раз ответил сосед
+inline const char *probe_why = "";  // почему последняя проверка не удалась (ASCII, для чёрного ящика)
 
 inline bool probe_peer(std::string &peer_role) {
   const std::string expected = device_kind == "scale" ? "screen" : "scale";
   const std::string role = local_role();
   if (role == "Клиент (слейв)") {
     const std::string ap = peer_ap_ip_now();
-    if (ap.empty() || !read_identity(ap, expected, peer_role, true)) return false;
+    if (ap.empty()) { probe_why = "cli_nogw"; return false; }
+    if (!read_identity(ap, expected, peer_role, true)) { probe_why = "cli_ident"; return false; }
     probe_ip = ap;
     return true;
   }
@@ -1282,9 +1284,10 @@ inline bool probe_peer(std::string &peer_role) {
       return true;
     }
     home_peer_ip.clear();
+    probe_why = "home_lookup";
     return false;
   }
-  if (role != "Точка доступа (мастер)") return false;
+  if (role != "Точка доступа (мастер)") { probe_why = "no_role"; return false; }
 
   // Мастер: сначала сосед, который сам представился (POST /hello от клиента). Старые прошивки
   // не представляются, для них остаётся перебор клиентов DHCP ниже.
@@ -1298,13 +1301,13 @@ inline bool probe_peer(std::string &peer_role) {
   // Ищем именно веб-морду второго устройства среди клиентов
   // DHCP, чтобы телефон, подключённый к той же AP, не считался соседом.
   wifi_sta_list_t stations = {};
-  if (esp_wifi_ap_get_sta_list(&stations) != ESP_OK || stations.num == 0) return false;
+  if (esp_wifi_ap_get_sta_list(&stations) != ESP_OK || stations.num == 0) { probe_why = "mst_nosta"; return false; }
   esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-  if (ap_netif == nullptr) return false;
+  if (ap_netif == nullptr) { probe_why = "mst_nonetif"; return false; }
   esp_netif_pair_mac_ip_t pairs[ESP_WIFI_MAX_CONN_NUM] = {};
   const int count = stations.num < ESP_WIFI_MAX_CONN_NUM ? stations.num : ESP_WIFI_MAX_CONN_NUM;
   for (int i = 0; i < count; i++) memcpy(pairs[i].mac, stations.sta[i].mac, 6);
-  if (esp_netif_dhcps_get_clients_by_mac(ap_netif, count, pairs) != ESP_OK) return false;
+  if (esp_netif_dhcps_get_clients_by_mac(ap_netif, count, pairs) != ESP_OK) { probe_why = "mst_dhcp"; return false; }
   const uint32_t now = now_ms();
   for (int i = 0; i < count; i++) {
     if (pairs[i].ip.addr == 0) continue;
@@ -1336,6 +1339,7 @@ inline bool probe_peer(std::string &peer_role) {
     peer_candidate_cache[cache_slot].checked_at = now;
     peer_candidate_cache[cache_slot].valid = true;
   }
+  probe_why = "mst_noident";
   return false;
 }
 
@@ -1381,8 +1385,8 @@ inline void peer_monitor_task(void *) {
       if (!prev_known || linked != prev_linked) {
         evlog(linked ? 'i' : 'w', "Связь с соседом: %s", linked ? "есть" : "потеряна");
         evlog('i', "Сеть: %s", net_snapshot().c_str());
-        bb::key("LINK", "%s role=%s peer=%s %s", linked ? "up" : "DOWN", role_code(),
-                linked ? probe_ip.c_str() : "-", net_code().c_str());
+        bb::key("LINK", "%s role=%s peer=%s why=%s %s", linked ? "up" : "DOWN", role_code(),
+                linked ? probe_ip.c_str() : "-", linked ? "-" : probe_why, net_code().c_str());
       }
       prev_known = true;
       prev_linked = linked;
@@ -1404,18 +1408,53 @@ inline bool peer_ip_now(std::string &ip) {
 
 // Экран забирает у весов их /status раз в 2 с и показывает на своей странице
 // вес и калибровку. Запросы идут из отдельной задачи, а не из HTTP-обработчика.
+// Polling of the neighbour's /status. Runs on BOTH devices identically (the firmware is meant to be
+// one codebase: a scale can be a screen and vice versa). Failures are written to the black box as
+// streaks: one line when a streak starts, one when it ends, plus counters in every SAMPLE line.
+inline uint32_t pd_ok_total = 0, pd_fail_total = 0;
 inline void peer_data_task(void *) {
+  const std::string expected = device_kind == "scale" ? "screen" : "scale";
+  const std::string kind_field = "\"kind\":\"" + expected + "\"";
+  uint32_t streak = 0, streak_start_s = 0, last_ok_s = 0;
   while (true) {
     std::string ip;
-    if (peer_ip_now(ip)) {
+    const uint32_t up_s = (uint32_t) (esp_timer_get_time() / 1000000);
+    bool ok = false;
+    const char *why = "ok";
+    int err = 0, http = 0;
+    if (!peer_ip_now(ip)) {
+      why = "noip";
+    } else {
       std::string r;
-      if (prov_link::get_request("http://" + ip + "/status", r, 1500) && r.size() > 2 &&
-          r.front() == '{' && r.back() == '}' && r.find("\"kind\":\"scale\"") != std::string::npos &&
-          peer_status_lock != nullptr && xSemaphoreTake(peer_status_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+      if (!prov_link::get_request("http://" + ip + "/status", r, 1500, &err, &http)) {
+        why = "req";
+      } else if (!(r.size() > 2 && r.front() == '{' && r.back() == '}' && r.find(kind_field) != std::string::npos)) {
+        why = "badbody";
+      } else if (peer_status_lock != nullptr && xSemaphoreTake(peer_status_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
         peer_data = r;
         peer_data_at = now_ms();
         xSemaphoreGive(peer_status_lock);
+        ok = true;
+      } else {
+        why = "lock";
       }
+    }
+    if (ok) {
+      pd_ok_total++;
+      if (streak > 0) {
+        bb::key("PDATA", "ok again after %lu fails, down %lus", (unsigned long) streak,
+                (unsigned long) (up_s - streak_start_s));
+        streak = 0;
+      }
+      last_ok_s = up_s;
+    } else {
+      pd_fail_total++;
+      if (streak == 0) {
+        streak_start_s = up_s;
+        bb::key("PDATA", "FAIL why=%s err=%s http=%d ip=%s since_ok=%lus", why, esp_err_to_name((esp_err_t) err),
+                http, ip.empty() ? "-" : ip.c_str(), (unsigned long) (up_s - last_ok_s));
+      }
+      streak++;
     }
     vTaskDelay(pdMS_TO_TICKS(2000));
   }
@@ -2258,7 +2297,7 @@ static const char *test_label(const std::string &n) {
   if (n == "test_role") return "состояние роли";
   if (n == "test_scan") return "скан эфира";
   if (n == "test_peer") return "проверка соседа";
-  if (n == "test_peer_data") return "данные весов на экране";
+  if (n == "test_peer_data") return "данные соседа";
   if (n == "test_export") return "экспорт настроек";
   if (n == "test_update") return "проверка обновления прошивки";
   if (n == "test_resources") return "ресурсы: память и сокеты";
@@ -2329,10 +2368,7 @@ static void test_task(void *arg) {
              home_peer_ip.empty() ? "пуст" : home_peer_ip.c_str(), peer_misses);
     set_status("Проверка соседа записана в журнал");
   } else if (self == "test_peer_data") {
-    if (device_kind != "screen") {
-      evlog('i', "[%s] тест нужен только на экране", clock_stamp().c_str());
-      set_status("Тест выполняется на экране");
-    } else {
+    {
       uint32_t age = 0;
       size_t size = 0;
       bool have = false;
@@ -2342,9 +2378,12 @@ static void test_task(void *arg) {
         age = now_ms() - peer_data_at;
         xSemaphoreGive(peer_status_lock);
       }
-      evlog('i', "[%s] данные весов: %s, %u байт, возраст %lu мс", clock_stamp().c_str(),
-               have ? "есть" : "нет", (unsigned) size, (unsigned long) age);
-      set_status(have && age < 10000 ? "Данные весов свежие" : "Данных весов нет или они устарели");
+      evlog('i', "[%s] данные соседа: %s, %u байт, возраст %lu мс, успешных опросов %lu, сбоев %lu",
+               clock_stamp().c_str(), have ? "есть" : "нет", (unsigned) size, (unsigned long) age,
+               (unsigned long) pd_ok_total, (unsigned long) pd_fail_total);
+      bb::key("TEST", "peer_data have=%d size=%u age_ms=%lu ok=%lu fail=%lu", have ? 1 : 0, (unsigned) size,
+              (unsigned long) age, (unsigned long) pd_ok_total, (unsigned long) pd_fail_total);
+      set_status(have && age < 10000 ? "Данные соседа свежие" : "Данных соседа нет или они устарели");
     }
   } else if (self == "test_resources") {
     // Занятые сокеты считаем перебором дескрипторов пула LWIP: getsockopt успешен только у открытых
@@ -2525,11 +2564,11 @@ inline void bb_sampler_task(void *) {
       if (peer_ip_buf[0]) snprintf(pip, sizeof(pip), "%s", peer_ip_buf);
       xSemaphoreGive(peer_status_lock);
     }
-    const uint32_t data_age = (device_kind == "screen" && peer_data_at != 0) ? (now_ms() - peer_data_at) / 1000 : 0;
-    bb::line("SAMPLE", "heap=%lu min=%lu blk=%lu role=%s link=%d peer=%s miss=%d rssi=%d dage=%lu win=%d",
+    const uint32_t data_age = peer_data_at != 0 ? (now_ms() - peer_data_at) / 1000 : 0;
+    bb::line("SAMPLE", "heap=%lu min=%lu blk=%lu role=%s link=%d peer=%s miss=%d rssi=%d dage=%lu pd=%lu/%lu win=%d",
              (unsigned long) esp_get_free_heap_size(), (unsigned long) esp_get_minimum_free_heap_size(),
              (unsigned long) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), role_code(), linked ? 1 : 0, pip,
-             peer_misses, sta ? (int) ap.rssi : 0, (unsigned long) data_age, window_open() ? 1 : 0);
+             peer_misses, sta ? (int) ap.rssi : 0, (unsigned long) data_age, (unsigned long) pd_ok_total, (unsigned long) pd_fail_total, window_open() ? 1 : 0);
     bb::tick();
     vTaskDelay(pdMS_TO_TICKS(30000));
   }
@@ -2639,7 +2678,7 @@ inline void start(int port) {
   if (peer_status_lock == nullptr) peer_status_lock = xSemaphoreCreateMutex();
   if (peer_status_lock != nullptr) {
     xTaskCreate(peer_monitor_task, "peer_monitor", 8192, nullptr, 1, nullptr);
-    if (device_kind == "screen") xTaskCreate(peer_data_task, "peer_data", 6144, nullptr, 1, nullptr);
+    xTaskCreate(peer_data_task, "peer_data", 6144, nullptr, 1, nullptr);
   } else {
     evlog('e', "cannot create peer status mutex");
   }

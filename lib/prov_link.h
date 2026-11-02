@@ -22,7 +22,9 @@ inline esp_err_t collect_response(esp_http_client_event_t *evt) {
   return ESP_OK;
 }
 
-inline bool get_request(const std::string &url, std::string &response, int timeout_ms = 800) {
+// err_out / http_out (optional): esp_err_t and HTTP status of the attempt, for the black box.
+inline bool get_request(const std::string &url, std::string &response, int timeout_ms = 800,
+                        int *err_out = nullptr, int *http_out = nullptr) {
   esp_http_client_config_t cfg = {};
   cfg.url = url.c_str();
   cfg.method = HTTP_METHOD_GET;
@@ -34,6 +36,8 @@ inline bool get_request(const std::string &url, std::string &response, int timeo
   esp_err_t err = esp_http_client_perform(client);
   int status = esp_http_client_get_status_code(client);
   esp_http_client_cleanup(client);
+  if (err_out != nullptr) *err_out = (int) err;
+  if (http_out != nullptr) *http_out = status;
   return err == ESP_OK && status == 200;
 }
 
