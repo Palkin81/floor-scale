@@ -51,6 +51,9 @@ inline std::string setup_ssid;
 // Версия протокола обмена между устройствами (поле proto в /peer_identity и /status).
 // Растёт при несовместимых изменениях; устройство без поля считается версией 0.
 inline constexpr int kProto = 1;
+// Code version: bumped by hand with every change, so the page and the black box show which code is on the device.
+// (ESPHome build time is NOT the compile time: with reproducible builds it only changes with the config.)
+inline constexpr const char *kFwVersion = "12.0.15";
 inline int peer_proto = -1;                 // версия протокола соседа по последнему ответу, -1 = нет данных
 inline std::string peer_host;
 inline std::function<void(const std::string &, const std::string &)> on_creds;
@@ -1871,7 +1874,7 @@ static esp_err_t h_update_info(httpd_req_t *req) {
   std::string r = head;
   r += "\"chip\":\"" + json_escape(chip_name()) + "\",\"running\":\"" + json_escape(u.running.c_str()) +
        "\",\"next\":\"" + json_escape(u.next.c_str()) + "\",\"name\":\"" + json_escape(u.name.c_str()) +
-       "\",\"built\":\"" + json_escape((u.build + " · " + u.sha).c_str()) + "\",\"busy\":" +
+       "\",\"built\":\"" + json_escape((std::string("v") + kFwVersion + " · " + u.sha).c_str()) + "\",\"busy\":" +
        (update_busy ? "true" : "false") + "}";
   httpd_resp_set_type(req, "application/json; charset=utf-8");
   return httpd_resp_send(req, r.c_str(), r.size());
@@ -2832,10 +2835,10 @@ inline void start(int port) {
     if (run != nullptr && esp_ota_get_partition_description(run, &d) == ESP_OK) {
       char hex[9];
       for (int i = 0; i < 4; i++) snprintf(hex + i * 2, 3, "%02x", d.app_elf_sha256[i]);
-      bb::build = hex;
+      bb::build = std::string(hex) + "/v" + kFwVersion;
     }
   }
-  bb::key("START", "http server kind=%s proto=%d", device_kind.c_str(), kProto);
+  bb::key("START", "http server kind=%s proto=%d fw=v%s", device_kind.c_str(), kProto, kFwVersion);
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port = port;
   // По умолчанию 8 обработчиков; у нас 12 маршрутов, лишние тихо отбрасывались (404)
