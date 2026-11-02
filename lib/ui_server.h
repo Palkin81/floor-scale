@@ -518,9 +518,9 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <p class="hint" style="margin:0 0 12px">Запрос к соседу по адресу точки и по имени. Пишет ответ, время ответа, запомненный адрес соседа и число пропущенных проверок связи подряд.</p>
 <button class="btn" data-test="peer">Проверить соседа</button>
 </div>
-<div class="glass card" id="tc-pd" hidden>
-<h3 style="margin:0 0 6px">Данные весов на экране</h3>
-<p class="hint" style="margin:0 0 12px">Пишет, получены ли от весов вес и калибровка, размер ответа и его возраст. Данные считаются свежими, если им меньше 10 с.</p>
+<div class="glass card" id="tc-pd">
+<h3 style="margin:0 0 6px">Данные соседа</h3>
+<p class="hint" style="margin:0 0 12px">Пишет, получены ли от соседа данные состояния, размер ответа, его возраст и число сбоев опроса. Данные считаются свежими, если им меньше 10 с.</p>
 <button class="btn" data-test="peer_data">Проверить данные соседа</button>
 </div>
 <div class="glass card">
@@ -737,7 +737,6 @@ txt('n-win',j.window?'Окно открыто: устройство приним
 // система
 txt('s-dev',title);
 txt('s-clock',j.clock_ts?new Date(j.clock_ts*1000).toLocaleString('ru-RU'):'не задано');
-vis('tc-pd',!isScale);
 // калибровка
 vis('cal-note',!W);
 if(W)renderCurve(W.curve);else renderCurve('');
