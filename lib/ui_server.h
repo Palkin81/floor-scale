@@ -2710,8 +2710,9 @@ inline void ft_boot() {
 
 // relay=1 in the body marks a request forwarded by the neighbour: it is not forwarded again.
 static esp_err_t h_ft_start(httpd_req_t *req) {
+  // Кнопка на странице шлёт POST без тела; тело есть только у запроса от соседа (relay=1)
   std::string b;
-  if (recv_body(req, b, 60) < 0) return reply_msg(req, "Ошибка запроса");
+  if (req->content_len > 0 && recv_body(req, b, 60) < 0) return reply_msg(req, "Ошибка запроса");
   const bool relay = form_value(b, "relay") == "1";
   if (ft_phase != 0) return reply_msg(req, "Тест уже идёт");
   ft_set(1);
@@ -2728,8 +2729,9 @@ static esp_err_t h_ft_start(httpd_req_t *req) {
 }
 
 static esp_err_t h_ft_cancel(httpd_req_t *req) {
+  // Кнопка на странице шлёт POST без тела; тело есть только у запроса от соседа (relay=1)
   std::string b;
-  if (recv_body(req, b, 60) < 0) return reply_msg(req, "Ошибка запроса");
+  if (req->content_len > 0 && recv_body(req, b, 60) < 0) return reply_msg(req, "Ошибка запроса");
   const bool relay = form_value(b, "relay") == "1";
   const int was = ft_phase;
   ft_set(0);
