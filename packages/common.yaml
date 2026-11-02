@@ -164,6 +164,12 @@ script:
                       if (id(role_idle_scans) >= 1) {
                         ESP_LOGI("role", "No peer after recheck; staying AP, scanning stopped");
                         bb::key("ROLE", "no peer after recheck -> AP, scan stopped");
+                        if (saved_setup_sta) {
+                          // Master must not keep a saved client config for the setup network: its retries
+                          // restart Wi-Fi and kick clients, and it would jump to the peer AP as soon as it appears.
+                          const bool cleared = netrole::clear_saved_sta(id(wifi_comp));
+                          bb::key("ROLE", "master: saved setup sta cleared=%d", cleared ? 1 : 0);
+                        }
                         id(role_selected) = true;
                       } else {
                         id(role_idle_scans) = 1;
