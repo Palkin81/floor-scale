@@ -167,6 +167,22 @@ inline void begin() {
   line("BOOT", "%s", l + 6);
 }
 
+// Small persistent flags next to the log (same NVS namespace), e.g. the full-test phase.
+inline uint8_t state_get(const char *k, uint8_t def = 0) {
+  if (!ready) return def;
+  uint8_t v = def;
+  nvs_get_u8(h, k, &v);
+  return v;
+}
+
+inline void state_set(const char *k, uint8_t v) {
+  if (!ready || lock == nullptr) return;
+  if (xSemaphoreTake(lock, pdMS_TO_TICKS(500)) != pdTRUE) return;
+  nvs_set_u8(h, k, v);
+  nvs_commit(h);
+  xSemaphoreGive(lock);
+}
+
 inline void clear() {
   if (lock == nullptr || !ready) return;
   if (xSemaphoreTake(lock, pdMS_TO_TICKS(500)) != pdTRUE) return;

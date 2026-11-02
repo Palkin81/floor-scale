@@ -92,6 +92,7 @@ inline char peer_ip_buf[16] = "";
 inline std::string home_peer_ip;           // последний рабочий адрес соседа в домашней сети
 inline std::string peer_data;              // последний ответ /status соседа (только экран)
 inline uint32_t peer_data_at = 0;          // когда получен, мс
+inline uint32_t link_down_total = 0;       // сколько раз связь с соседом была потеряна (для полного теста)
 inline int peer_misses = 0;                // подряд пропущенных проверок связи
 
 // ---- устройство ----
@@ -487,6 +488,13 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <button class="back" type="button" data-go="sys">‹ Система</button>
 <p class="hint" style="margin:0 0 14px">Каждый тест пишет начало и конец в журнал устройства. Время в строках — внутреннее время устройства, если оно синхронизировано со страницей, иначе — время с запуска.</p>
 <div class="glass card">
+<h3 style="margin:0 0 6px">Полный тест</h3>
+<p class="hint" style="margin:0 0 12px">Оба устройства сами проходят проверки в текущей сети (около 1,5 минуты), затем ждут, пока вы подключите их к домашней сети в разделе «Сеть», и повторяют проверки там. Всё пишется в журнал чёрного ящика: после завершения скачайте журналы обоих устройств. Запускайте, когда устройства видят друг друга.</p>
+<div class="hint" id="ft-state" style="margin:0 0 12px;font-weight:600">Тест не запущен</div>
+<button class="btn pri" id="ft-start" type="button" style="margin-bottom:10px">Запустить полный тест</button>
+<button class="btn dng" id="ft-cancel" type="button">Остановить тест</button>
+</div>
+<div class="glass card">
 <h3 style="margin:0 0 6px">Чёрный ящик</h3>
 <p class="hint" style="margin:0 0 12px">Компактный журнал хранится в памяти устройства и переживает перезагрузки. Скачайте оба файла и передайте для разбора. Журнал соседа берётся через эту страницу, пока есть связь.</p>
 <a class="btn" style="display:flex;align-items:center;justify-content:center;text-decoration:none;margin-bottom:10px" href="/bb" download>Скачать журнал этого устройства</a>
@@ -701,6 +709,8 @@ s.split(' | ').forEach((p,i)=>box.append(el('span','pill',i===0?p.replace('но�
 }
 function render(j){
 isScale=j.kind==='scale';
+{const ft=j.ft|0,m=['Тест не запущен','Идёт этап A (текущая сеть), около 1,5 минуты','Этап A готов. Подключите оба устройства к домашней сети в разделе «Сеть»: тест продолжится сам','Идёт этап B (домашняя сеть), около 1,5 минуты'];
+txt('ft-state',m[ft]||m[0]);$('ft-start').disabled=ft!==0||!j.peer_link;$('ft-cancel').disabled=ft===0;}
 W=isScale?j:(j.scale||null);
 if(!ready){ready=true;go(location.hash.slice(1))}
 const title=j.title||'Floor Scale';txt('title',title);if(document.title!==title)document.title=title;
@@ -975,6 +985,13 @@ else say(res&&res.ok?'Устройство не ответило за 90 с: п�
 $('b-fwfile').onclick=()=>$('fw-in').click();$('fw-in').onchange=pickFw;$('b-fwgo').onclick=updateFw;
 $('b-open').onclick=openWin;$('b-reset').onclick=resetNet;$('b-scan').onclick=scan;$('b-reboot').onclick=rebootIt;
 document.querySelectorAll('[data-test]').forEach(b=>b.onclick=()=>runTest(b.dataset.test));
+$('ft-start').onclick=async()=>{
+if(!await ask('Запустить полный тест?','Оба устройства пройдут проверки и запишут результат в журнал. Во время теста не перезагружайте их и не меняйте сеть, пока не появится просьба.','Запустить',false))return;
+try{const j=await post('/ft_start');say(j.msg||'Тест запущен',true)}catch(e){say('Нет связи с устройством')}
+};
+$('ft-cancel').onclick=async()=>{
+try{const j=await post('/ft_cancel');say(j.msg||'Тест остановлен')}catch(e){say('Нет связи с устройством')}
+};
 $('bb-clear').onclick=async()=>{
 if(!await ask('Очистить журнал?','Будет стёрт журнал этого устройства. Перед новым тестом это нормально.','Очистить',true))return;
 try{const j=await post('/bb_clear');say(j.msg||'Журнал очищен')}catch(e){say('Нет связи с устройством')}
@@ -1383,6 +1400,7 @@ inline void peer_monitor_task(void *) {
       static bool prev_known = false, prev_linked = false;
       if (!prev_known || linked != prev_linked) {
         evlog(linked ? 'i' : 'w', "Связь с соседом: %s", linked ? "есть" : "потеряна");
+        if (!linked && prev_known) link_down_total++;
         evlog('i', "Сеть: %s", net_snapshot().c_str());
         bb::key("LINK", "%s role=%s peer=%s why=%s %s", linked ? "up" : "DOWN", role_code(),
                 linked ? probe_ip.c_str() : "-", linked ? "-" : probe_why, net_code().c_str());
@@ -1510,6 +1528,7 @@ inline std::string status_json() {
   out += std::string(",\"peer_checked\":") + (checked ? "true" : "false");
   out += std::string(",\"peer_applicable\":") + (applicable ? "true" : "false");
   out += std::string(",\"peer_link\":") + (linked ? "true" : "false");
+  out += ",\"ft\":" + std::to_string((int) ft_phase);
   if (linked) out += ",\"peer_role\":\"" + json_escape(peer_role) + "\"";
   if (extra_status) out += "," + extra_status();
   if (device_kind == "screen" && peer_status_lock != nullptr &&
@@ -2549,6 +2568,180 @@ static esp_err_t h_prov(httpd_req_t *req) {
 }
 
 
+
+// ---- Full test ("Polnyj test") ----
+// Phase A runs in the current network (normally the setup network), then the test waits for the user
+// to connect both devices to the home network (state kept in NVS across the reboot), then phase B
+// repeats the same checks at home. Everything goes to the black box with tag FT.
+// ft_phase: 0 idle, 1 running A, 2 waiting for home network, 3 running B.
+inline volatile int ft_phase = 0;
+inline int sockets_in_use() {
+  int used = 0;
+  for (int fd = LWIP_SOCKET_OFFSET; fd < LWIP_SOCKET_OFFSET + CONFIG_LWIP_MAX_SOCKETS; fd++) {
+    int type = 0;
+    socklen_t len = sizeof(type);
+    if (lwip_getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) == 0) used++;
+  }
+  return used;
+}
+
+inline void ft_set(int p) {
+  ft_phase = p;
+  bb::state_set("ft", (uint8_t) p);
+}
+
+inline int ft_rssi() {
+  wifi_ap_record_t ap = {};
+  return esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? (int) ap.rssi : 0;
+}
+
+// One measuring window (~65 s): 12 probes of the neighbour at 5 s intervals plus counters of Wi-Fi/link events.
+// Returns false if the test was cancelled meanwhile.
+inline bool ft_window(const char *ph, int expect_phase) {
+  const uint32_t d0 = netrole::ev_sta_disc.load(), l0 = netrole::ev_ap_leave.load();
+  const uint32_t ld0 = link_down_total, ok0 = pd_ok_total, f0 = pd_fail_total;
+  const std::string expected = device_kind == "scale" ? "screen" : "scale";
+  bb::key("FT", "%s begin role=%s rssi=%d heap=%lu sock=%d/%d proto=%d peer_proto=%d %s", ph, role_code(), ft_rssi(),
+          (unsigned long) esp_get_free_heap_size(), sockets_in_use(), (int) CONFIG_LWIP_MAX_SOCKETS, kProto,
+          peer_proto, net_code().c_str());
+  int fails = 0, n = 0;
+  uint32_t rmin = 0xFFFFFFFF, rmax = 0, rsum = 0;
+  for (int i = 0; i < 12; i++) {
+    if (ft_phase != expect_phase) return false;
+    std::string ip, r, role;
+    int err = 0, http = 0;
+    const uint32_t t0 = now_ms();
+    bool ok = false;
+    const char *why = "noip";
+    if (peer_ip_now(ip)) {
+      ok = prov_link::get_request("http://" + ip + "/peer_identity", r, 2000, &err, &http) &&
+           r.find("\"kind\":\"" + expected + "\"") != std::string::npos;
+      why = ok ? "ok" : "req";
+    }
+    const uint32_t rtt = now_ms() - t0;
+    n++;
+    if (ok) {
+      rsum += rtt;
+      if (rtt < rmin) rmin = rtt;
+      if (rtt > rmax) rmax = rtt;
+    } else {
+      fails++;
+      bb::key("FT", "%s probe %d FAIL why=%s err=%s http=%d after %lums", ph, i + 1, why,
+              esp_err_to_name((esp_err_t) err), http, (unsigned long) rtt);
+    }
+    vTaskDelay(pdMS_TO_TICKS(5000));
+  }
+  const int okn = n - fails;
+  bb::key("FT", "%s rtt probes=%d fail=%d min=%lu avg=%lu max=%lu", ph, n, fails,
+          (unsigned long) (okn ? rmin : 0), (unsigned long) (okn ? rsum / okn : 0), (unsigned long) rmax);
+  const uint32_t dd = netrole::ev_sta_disc.load() - d0, dl = netrole::ev_ap_leave.load() - l0;
+  const uint32_t dld = link_down_total - ld0, dok = pd_ok_total - ok0, dfail = pd_fail_total - f0;
+  bb::key("FT", "%s deltas sta_disc=%lu ap_leave=%lu link_down=%lu pd_ok=%lu pd_fail=%lu minheap=%lu sock=%d", ph,
+          (unsigned long) dd, (unsigned long) dl, (unsigned long) dld, (unsigned long) dok, (unsigned long) dfail,
+          (unsigned long) esp_get_minimum_free_heap_size(), sockets_in_use());
+  const bool pass = fails == 0 && dd == 0 && dld == 0 && dfail <= 2;
+  bb::key("FT", "%s RESULT %s role=%s", ph, pass ? "PASS" : "FAIL", role_code());
+  return true;
+}
+
+inline void ft_finish(const char *how) {
+  ft_set(0);
+  bb::key("FT", "DONE %s", how);
+  set_status("Полный тест завершён. Скачайте журналы обоих устройств");
+  evlog('i', "Полный тест завершён");
+}
+
+// arg: 0 = start with phase A now, 1 = resume after reboot (wait for home network, then phase B)
+static void ft_task(void *arg) {
+  const int mode = (int) (intptr_t) arg;
+  if (mode == 0) {
+    set_status("Полный тест: этап A, около 1,5 минуты");
+    if (!ft_window("A", 1)) { vTaskDelete(nullptr); return; }
+    if (strcmp(role_code(), "HOME") == 0) {
+      ft_finish("single phase at home");
+      vTaskDelete(nullptr);
+      return;
+    }
+    ft_set(2);
+    bb::key("FT", "A done, waiting for home network");
+    set_status("Полный тест: этап A готов. Подключите устройства к домашней сети (раздел «Сеть»)");
+  }
+  uint32_t stable = 0, waited = 0;
+  while (ft_phase == 2) {
+    if (strcmp(role_code(), "HOME") == 0 && peer_link_state) stable += 2; else stable = 0;
+    if (stable >= 20) break;
+    waited += 2;
+    if (waited % 120 == 0) bb::key("FT", "waiting home network %lus role=%s link=%d", (unsigned long) waited, role_code(), peer_link_state ? 1 : 0);
+    if (waited >= 1800) {
+      ft_set(0);
+      bb::key("FT", "ABORT waited 30 min for home network");
+      vTaskDelete(nullptr);
+      return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+  if (ft_phase == 2) {
+    ft_set(3);
+    set_status("Полный тест: этап B в домашней сети, около 1,5 минуты");
+    if (ft_window("B", 3)) ft_finish("two phases");
+  }
+  vTaskDelete(nullptr);
+}
+
+inline void ft_launch(int mode) {
+  if (xTaskCreate(ft_task, "ft_task", 8192, (void *) (intptr_t) mode, 2, nullptr) != pdPASS) {
+    ft_set(0);
+    bb::key("FT", "ABORT cannot create task");
+  }
+}
+
+// Resume after a reboot: phase 2 continues, phases 1 and 3 were interrupted.
+inline void ft_boot() {
+  const int p = bb::state_get("ft", 0);
+  if (p == 2) {
+    ft_phase = 2;
+    bb::key("FT", "resume after reboot, waiting for home network, role=%s", role_code());
+    ft_launch(1);
+  } else if (p != 0) {
+    bb::state_set("ft", 0);
+    bb::key("FT", "interrupted by reboot in phase %d", p);
+  }
+}
+
+// relay=1 in the body marks a request forwarded by the neighbour: it is not forwarded again.
+static esp_err_t h_ft_start(httpd_req_t *req) {
+  std::string b;
+  if (recv_body(req, b, 60) < 0) return reply_msg(req, "Ошибка запроса");
+  const bool relay = form_value(b, "relay") == "1";
+  if (ft_phase != 0) return reply_msg(req, "Тест уже идёт");
+  ft_set(1);
+  bb::key("FT", "START %s role=%s build=%s", relay ? "by neighbor" : "by user", role_code(), bb::build.c_str());
+  bool forwarded = false;
+  if (!relay) {
+    std::string ip, resp;
+    forwarded = peer_ip_now(ip) && prov_link::post_text("http://" + ip + "/ft_start", "relay=1", resp, "application/x-www-form-urlencoded", 3000);
+    bb::key("FT", "neighbor start forwarded=%d", forwarded ? 1 : 0);
+  }
+  ft_launch(0);
+  return reply_msg(req, relay ? "Тест принят" : (forwarded ? "Тест запущен на обоих устройствах"
+                                                           : "Тест запущен только здесь: сосед не ответил"));
+}
+
+static esp_err_t h_ft_cancel(httpd_req_t *req) {
+  std::string b;
+  if (recv_body(req, b, 60) < 0) return reply_msg(req, "Ошибка запроса");
+  const bool relay = form_value(b, "relay") == "1";
+  const int was = ft_phase;
+  ft_set(0);
+  bb::key("FT", "CANCEL %s was_phase=%d", relay ? "by neighbor" : "by user", was);
+  if (!relay) {
+    std::string ip, resp;
+    if (peer_ip_now(ip)) prov_link::post_text("http://" + ip + "/ft_cancel", "relay=1", resp, "application/x-www-form-urlencoded", 3000);
+  }
+  set_status("Полный тест остановлен");
+  return reply_msg(req, "Тест остановлен");
+}
+
 // ---- Black box: sampler task and download endpoints ----
 // One compact line every 30 s: memory, role, link, signal. Enough to see trends, not a flood.
 inline void bb_sampler_task(void *) {
@@ -2644,7 +2837,7 @@ inline void start(int port) {
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port = port;
   // По умолчанию 8 обработчиков; у нас 12 маршрутов, лишние тихо отбрасывались (404)
-  cfg.max_uri_handlers = 32;
+  cfg.max_uri_handlers = 36;
   // Сокетов в системе мало (общий пул LWIP): страницы, опрос соседа, API ESPHome и панель делят его.
   // При нехватке закрываем самое давнее неактивное соединение вместо отказа новым (accept error 23).
   cfg.lru_purge_enable = true;
@@ -2682,6 +2875,13 @@ inline void start(int port) {
     evlog('e', "cannot create peer status mutex");
   }
 
+  u = {};
+  u.uri = "/ft_start"; u.method = HTTP_POST; u.handler = h_ft_start;
+  reg_uri(srv, u);
+  u = {};
+  u.uri = "/ft_cancel"; u.method = HTTP_POST; u.handler = h_ft_cancel;
+  reg_uri(srv, u);
+  ft_boot();
   u = {};
   u.uri = "/bb"; u.method = HTTP_GET; u.handler = h_bb;
   reg_uri(srv, u);
