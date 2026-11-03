@@ -148,7 +148,12 @@ script:
                 uint8_t found[6] = {0};
                 const bool has_saved_sta = netrole::saved_sta(saved);
                 const bool saved_setup_sta = has_saved_sta && saved == "${prov_ssid}";
-                if (has_saved_sta && !saved_setup_sta) {
+                if (netrole::own_ap_active() && ui::peer_link_state && !saved_setup_sta) {
+                  // The neighbour already joined our AP (it introduced itself): we are the master.
+                  // Another scan would only hop channels and drop clients (a phone was kicked at t64).
+                  bb::key("ROLE", "neighbour already linked to our AP -> master, scan stopped");
+                  id(role_selected) = true;
+                } else if (has_saved_sta && !saved_setup_sta) {
                   ESP_LOGI("role", "STA config exists: ssid=%s; keeping saved connection", saved.c_str());
                   bb::key("ROLE", "keep saved home sta");
                   id(role_selected) = true;
