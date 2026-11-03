@@ -133,6 +133,30 @@ interval:
     then:
       - lambda: |-
           ui::run_pending();   // команды и тесты с веб-страницы
+  # Master lost: a device that settled as a client of the setup network and then sees its own fallback AP
+  # up with no STA link for 30+ s promotes itself to master (devices are equal). ESPHome would otherwise
+  # retry the setup network forever next to the fallback AP, kicking that AP's clients every ~40 s.
+  - interval: 10s
+    then:
+      - lambda: |-
+          static uint32_t lost_since = 0;
+          std::string saved;
+          wifi_ap_record_t ap_rec = {};
+          const bool sta_up = esp_wifi_sta_get_ap_info(&ap_rec) == ESP_OK;
+          const bool candidate = id(role_selected) && !sta_up && netrole::own_ap_active() &&
+                                 netrole::saved_sta(saved) && saved == "${prov_ssid}";
+          const uint32_t now_s = (uint32_t) (esp_timer_get_time() / 1000000);
+          if (!candidate) {
+            lost_since = 0;
+          } else if (lost_since == 0) {
+            lost_since = now_s ? now_s : 1;
+          } else if (now_s - lost_since >= 30) {
+            const bool cleared = netrole::clear_saved_sta(id(wifi_comp));
+            id(wifi_comp)->clear_sta();
+            bb::key("ROLE", "master lost %lus, own AP up -> promoted to master, sta list cleared (saved=%d)",
+                    (unsigned long) (now_s - lost_since), cleared ? 1 : 0);
+            lost_since = 0;
+          }
 
 script:
   - id: pick_role
