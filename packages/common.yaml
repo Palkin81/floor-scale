@@ -140,22 +140,33 @@ interval:
     then:
       - lambda: |-
           static uint32_t lost_since = 0;
+          static uint32_t last_diag = 0;
           std::string saved;
           wifi_ap_record_t ap_rec = {};
           const bool sta_up = esp_wifi_sta_get_ap_info(&ap_rec) == ESP_OK;
-          const bool candidate = id(role_selected) && !sta_up && netrole::own_ap_active() &&
-                                 netrole::saved_sta(saved) && saved == "${prov_ssid}";
+          const bool has_saved = netrole::saved_sta(saved);
+          const bool setup_saved = has_saved && saved == "${prov_ssid}";
+          const bool rs = id(role_selected);
           const uint32_t now_s = (uint32_t) (esp_timer_get_time() / 1000000);
-          if (!candidate) {
+          // The timer is reset only by a real STA link; short glitches of the other flags (the STA is
+          // restarted every ~7 s during ESPHome retries) must not restart the countdown.
+          if (sta_up || !rs || (has_saved && !setup_saved)) {
             lost_since = 0;
-          } else if (lost_since == 0) {
-            lost_since = now_s ? now_s : 1;
-          } else if (now_s - lost_since >= 30) {
-            const bool cleared = netrole::clear_saved_sta(id(wifi_comp));
-            id(wifi_comp)->clear_sta();
-            bb::key("ROLE", "master lost %lus, own AP up -> promoted to master, sta list cleared (saved=%d)",
-                    (unsigned long) (now_s - lost_since), cleared ? 1 : 0);
-            lost_since = 0;
+          } else if (setup_saved) {
+            if (lost_since == 0) lost_since = now_s ? now_s : 1;
+            const uint32_t lost = now_s - lost_since;
+            if (now_s - last_diag >= 60) {
+              last_diag = now_s;
+              bb::line("WATCH", "no sta link %lus rs=%d ap=%d saved=%d", (unsigned long) lost, rs ? 1 : 0,
+                       netrole::own_ap_active() ? 1 : 0, setup_saved ? 1 : 0);
+            }
+            if (lost >= 90 && netrole::own_ap_active()) {
+              const bool cleared = netrole::clear_saved_sta(id(wifi_comp));
+              id(wifi_comp)->clear_sta();
+              bb::key("ROLE", "master lost %lus, own AP up -> promoted to master, sta list cleared (saved=%d)",
+                      (unsigned long) lost, cleared ? 1 : 0);
+              lost_since = 0;
+            }
           }
 
 script:
