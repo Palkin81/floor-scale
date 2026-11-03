@@ -148,10 +148,14 @@ script:
                 uint8_t found[6] = {0};
                 const bool has_saved_sta = netrole::saved_sta(saved);
                 const bool saved_setup_sta = has_saved_sta && saved == "${prov_ssid}";
-                if (netrole::own_ap_active() && ui::peer_link_state && !saved_setup_sta) {
+                if (netrole::own_ap_active() && ui::peer_link_state && (!has_saved_sta || saved_setup_sta)) {
                   // The neighbour already joined our AP (it introduced itself): we are the master.
                   // Another scan would only hop channels and drop clients (a phone was kicked at t64).
-                  bb::key("ROLE", "neighbour already linked to our AP -> master, scan stopped");
+                  // ESPHome keeps retrying a configured STA network next to the fallback AP (sta_disc 201
+                  // every ~6 s, kicks AP clients), so the master drops its STA list.
+                  netrole::clear_saved_sta(id(wifi_comp));
+                  id(wifi_comp)->clear_sta();
+                  bb::key("ROLE", "neighbour already linked to our AP -> master, scan stopped, sta list cleared");
                   id(role_selected) = true;
                 } else if (has_saved_sta && !saved_setup_sta) {
                   ESP_LOGI("role", "STA config exists: ssid=%s; keeping saved connection", saved.c_str());
@@ -169,12 +173,11 @@ script:
                       if (id(role_idle_scans) >= 1) {
                         ESP_LOGI("role", "No peer after recheck; staying AP, scanning stopped");
                         bb::key("ROLE", "no peer after recheck -> AP, scan stopped");
-                        if (saved_setup_sta) {
-                          // Master must not keep a saved client config for the setup network: its retries
-                          // restart Wi-Fi and kick clients, and it would jump to the peer AP as soon as it appears.
-                          const bool cleared = netrole::clear_saved_sta(id(wifi_comp));
-                          bb::key("ROLE", "master: saved setup sta cleared=%d", cleared ? 1 : 0);
-                        }
+                        // Master must not keep a client config for the setup network: ESPHome retries it
+                        // (restarting Wi-Fi, kicking clients) and it would jump to the peer AP when it appears.
+                        const bool cleared = netrole::clear_saved_sta(id(wifi_comp));
+                        id(wifi_comp)->clear_sta();
+                        bb::key("ROLE", "master: sta list cleared (saved=%d)", cleared ? 1 : 0);
                         id(role_selected) = true;
                       } else {
                         id(role_idle_scans) = 1;
@@ -184,6 +187,10 @@ script:
                     } else {
                       ESP_LOGI("role", "No peer setup AP found; will scan again");
                     }
+                  } else if (netrole::own_ap_active() && netrole::established() && !netrole::peer_persisting(found)) {
+                    // Established device sees a peer AP for the first time: maybe a newcomer's transient AP.
+                    bb::key("ROLE", "established, peer AP seen first time -> rescan in 10s");
+                    id(role_idle_scans) = 0;
                   } else if (netrole::should_join_as_client(found)) {
                     if (saved_setup_sta) {
                       ESP_LOGI("role", "Peer setup AP selected; existing STA config will connect");
@@ -199,11 +206,13 @@ script:
                     ESP_LOGI("role", "MAC tie-break selects AP; clearing saved setup STA and staying AP");
                     bb::key("ROLE", "tiebreak -> AP, clearing saved setup sta");
                     const bool cleared = netrole::clear_saved_sta(id(wifi_comp));
+                    id(wifi_comp)->clear_sta();
                     ESP_LOGI("role", "saved setup STA cleared=%s", cleared ? "yes" : "no");
                     id(role_selected) = true;
                   } else {
                     ESP_LOGI("role", "Peer setup AP found; MAC rule selects this device as access point");
                     bb::key("ROLE", "peer AP found, tiebreak -> AP");
+                    id(wifi_comp)->clear_sta();
                     id(role_selected) = true;
                   }
                 }
