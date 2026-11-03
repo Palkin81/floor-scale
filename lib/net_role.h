@@ -238,6 +238,22 @@ inline bool own_ap_active() {
 // established: join it regardless of MAC. Use MAC only to break the tie when
 // both devices independently started their fallback APs before seeing each other.
 inline constexpr uint32_t kNewcomerS = 30;
+
+// A device that has been up for a while (its AP is established) must not react to the FIRST sighting of
+// a peer AP: it may be a newcomer's transient AP (it lives a few seconds, then the newcomer reboots as a
+// client). Only an AP seen again >= 8 s later (and still there) is a real twin that needs the MAC tie-break.
+inline bool established() { return (uint32_t) (esp_timer_get_time() / 1000000) >= kNewcomerS; }
+inline bool peer_persisting(const uint8_t found[6]) {
+  static uint8_t seen[6] = {0};
+  static uint32_t first_ms = 0;
+  const uint32_t now = (uint32_t) (esp_timer_get_time() / 1000);
+  if (first_ms == 0 || memcmp(seen, found, 6) != 0 || now - first_ms > 90000) {
+    memcpy(seen, found, 6);
+    first_ms = now ? now : 1;
+    return false;
+  }
+  return now - first_ms >= 8000;
+}
 inline bool should_join_as_client(const uint8_t found[6]) {
   if (!own_ap_active()) {
     char peer_s[18];
