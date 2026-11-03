@@ -53,7 +53,7 @@ inline std::string setup_ssid;
 inline constexpr int kProto = 1;
 // Code version: bumped by hand with every change, so the page and the black box show which code is on the device.
 // (ESPHome build time is NOT the compile time: with reproducible builds it only changes with the config.)
-inline constexpr const char *kFwVersion = "12.0.20";
+inline constexpr const char *kFwVersion = "12.1.0";
 inline int peer_proto = -1;                 // версия протокола соседа по последнему ответу, -1 = нет данных
 inline std::string peer_host;
 inline std::function<void(const std::string &, const std::string &)> on_creds;
@@ -395,6 +395,7 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <h2>Разделы</h2>
 <div class="glass list" style="padding:0">
 <button class="net" type="button" data-go="cal"><b>Калибровка</b><span class="v" id="l-cal"></span><svg viewBox="0 0 24 24"><use href="#i-chev"/></svg></button>
+<button class="net" type="button" data-go="mode"><b>Режим и роль</b><span class="v" id="l-mode"></span><svg viewBox="0 0 24 24"><use href="#i-chev"/></svg></button>
 <button class="net" type="button" data-go="cfg"><b>Настройки: экспорт и импорт</b><svg viewBox="0 0 24 24"><use href="#i-chev"/></svg></button>
 <button class="net" type="button" data-go="fw"><b>Обновление прошивки</b><svg viewBox="0 0 24 24"><use href="#i-chev"/></svg></button>
 <button class="net" type="button" data-go="tests"><b>Тесты</b><svg viewBox="0 0 24 24"><use href="#i-chev"/></svg></button>
@@ -468,6 +469,39 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <button class="btn dng" id="b-import">Импортировать</button>
 </div>
 </div>
+</section>
+<section class="page" id="p-mode">
+<button class="back" type="button" data-go="sys">‹ Система</button>
+<p class="hint" id="m-trial" style="margin:0 0 14px;font-weight:600" hidden></p>
+<h2 style="margin-top:6px">Режим</h2>
+<div class="glass card">
+<p class="hint" style="margin:0 0 12px">«С удалённым экраном»: весы и экран работают парой. «Простой»: устройство работает само, без соседа (режим подключается в следующем обновлении, сейчас значение только сохраняется).</p>
+<div class="stack">
+<select class="inp" id="m-mode" aria-label="Режим работы"><option value="0">С удалённым экраном</option><option value="1">Простой</option></select>
+</div>
+</div>
+<h2>Роль этого устройства</h2>
+<div class="glass card">
+<p class="hint" style="margin:0 0 12px">Роль определяется прошивкой. Переключение роли станет доступно после объединения прошивок (этап унификации).</p>
+<div class="stack">
+<select class="inp" id="m-role" disabled aria-label="Роль этого устройства"><option value="scale">Весы</option><option value="screen">Экран</option></select>
+</div>
+</div>
+<h2>Сосед (вручную)</h2>
+<div class="glass card">
+<p class="hint" style="margin:0 0 12px">Если автоматический поиск соседа в домашней сети не срабатывает, задайте его адрес. Пустое поле: поиск автоматический. Порядок поиска: заданный адрес, затем запомненный, затем поиск по сети.</p>
+<div class="stack">
+<input class="inp" id="m-ip" inputmode="decimal" placeholder="IP соседа, например 192.168.1.20" aria-label="IP соседа" autocomplete="off">
+<input class="inp" id="m-mac" placeholder="MAC соседа (необязательно)" aria-label="MAC соседа" autocomplete="off" autocapitalize="characters">
+<select class="inp" id="m-prole" aria-label="Роль соседа"><option value="">Роль соседа: определить автоматически</option><option value="scale">Сосед: весы</option><option value="screen">Сосед: экран</option></select>
+</div>
+</div>
+<div class="stack" style="margin-top:14px">
+<button class="btn pri" id="m-save" type="button">Применить пробно</button>
+<button class="btn" id="m-confirm" type="button" disabled>Подтвердить</button>
+<button class="btn dng" id="m-revert" type="button" disabled>Вернуть прежние</button>
+</div>
+<p class="hint" style="margin-top:14px">Защита от ошибок: изменение применяется пробно и само откатывается через 3 минуты, если его не подтвердить, или сразу при перезагрузке устройства. Три быстрых включения подряд по питанию (менее 15 секунд работы каждое) сбрасывают настройки и сохранённую сеть.</p>
 </section>
 <section class="page" id="p-fw">
 <button class="back" type="button" data-go="sys">‹ Система</button>
@@ -674,8 +708,8 @@ finally{clearTimeout(id)}
 const post=(u,b,ms)=>api(u,b?{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(b)}:{method:'POST'},ms);
 function setBusy(b){busy=b;document.querySelectorAll('.btn,.net').forEach(x=>x.disabled=b)}
 /* ---------- разделы ---------- */
-const pages=['home','net','sys','cal','cfg','fw','tests'];
-const tabOf={cal:'sys',cfg:'sys',fw:'sys',tests:'sys'};
+const pages=['home','net','sys','cal','cfg','fw','tests','mode'];
+const tabOf={cal:'sys',cfg:'sys',fw:'sys',tests:'sys',mode:'sys'};
 let curPage='';
 function go(p){
 if(!pages.includes(p))p='home';
@@ -686,6 +720,7 @@ pages.forEach(x=>$('p-'+x).classList.toggle('on',x===p));
 ['home','net','sys'].forEach(x=>$('t-'+x).setAttribute('aria-selected',x===tab));
 scrollTo(0,0);
 if(p==='fw')loadFw();
+if(p==='mode')loadMode();
 }
 const nav=p=>{if(location.hash.slice(1)===p)go(p);else location.hash=p};
 document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>nav(t.dataset.p));
@@ -714,6 +749,7 @@ s.split(' | ').forEach((p,i)=>box.append(el('span','pill',i===0?p.replace('но�
 function render(j){
 isScale=j.kind==='scale';
 {const ft=j.ft|0,m=['Тест не запущен','Идёт этап A (текущая сеть), около 1,5 минуты','Этап A готов. Подключите оба устройства к домашней сети в разделе «Сеть»: тест продолжится сам','Идёт этап B (домашняя сеть), около 1,5 минуты'];
+txt('l-mode',(j.trial|0)>0?'ждёт подтверждения':'');
 txt('ft-state',m[ft]||m[0]);$('ft-start').disabled=ft!==0||!j.peer_link;$('ft-cancel').disabled=ft===0;}
 W=isScale?j:(j.scale||null);
 if(!ready){ready=true;go(location.hash.slice(1))}
@@ -931,6 +967,31 @@ e.target.value='';
 };
 /* ---------- обновление прошивки ---------- */
 let uploading=false,fwInfo=null,fwFile=null;
+let mCfg=null,mTimer=0;
+function mRender(c){
+mCfg=c;
+$('m-mode').value=String(c.mode);$('m-role').value=c.kind;
+if(document.activeElement!==$('m-ip'))$('m-ip').value=c.peer_ip||'';
+if(document.activeElement!==$('m-mac'))$('m-mac').value=c.peer_mac||'';
+$('m-prole').value=c.peer_role||'';
+const on=c.trial>0;
+$('m-confirm').disabled=!on;$('m-revert').disabled=!on;
+const t=$('m-trial');t.hidden=!on;
+if(on)t.textContent='Настройки применены пробно. Подтвердите в течение '+c.trial+' с, иначе вернутся прежние.';
+clearTimeout(mTimer);
+if(on)mTimer=setTimeout(loadMode,1000);
+}
+async function loadMode(){
+try{mRender(await api('/devcfg'))}catch(e){say('Нет связи с устройством')}
+}
+$('m-save').onclick=async()=>{
+try{
+const j=await post('/devcfg',{mode:$('m-mode').value,peer_ip:$('m-ip').value.trim(),peer_mac:$('m-mac').value.trim(),peer_role:$('m-prole').value});
+say(j.msg,!j.ok);loadMode();
+}catch(e){say('Нет связи с устройством')}
+};
+$('m-confirm').onclick=async()=>{try{const j=await post('/devcfg_confirm');say(j.msg);loadMode()}catch(e){say('Нет связи с устройством')}};
+$('m-revert').onclick=async()=>{try{const j=await post('/devcfg_revert');say(j.msg);loadMode()}catch(e){say('Нет связи с устройством')}};
 async function loadFw(){
 try{
 fwInfo=await api('/update_info');
@@ -1290,7 +1351,12 @@ inline bool probe_peer(std::string &peer_role) {
     return true;
   }
   if (role == "Домашняя сеть") {
-    // Сначала последний рабочий адрес: mDNS-запрос теряется заметно чаще, чем HTTP.
+    // Сначала адрес, заданный вручную на странице «Режим и роль», потом последний рабочий:
+    // mDNS-запрос теряется заметно чаще, чем HTTP.
+    if (devcfg::cur.peer_ip[0] && read_identity(devcfg::cur.peer_ip, expected, peer_role)) {
+      probe_ip = devcfg::cur.peer_ip;
+      return true;
+    }
     if (!home_peer_ip.empty() && read_identity(home_peer_ip, expected, peer_role)) {
       probe_ip = home_peer_ip;
       return true;
@@ -1533,6 +1599,8 @@ inline std::string status_json() {
   out += std::string(",\"peer_applicable\":") + (applicable ? "true" : "false");
   out += std::string(",\"peer_link\":") + (linked ? "true" : "false");
   out += ",\"ft\":" + std::to_string((int) ft_phase);
+  out += ",\"mode\":" + std::to_string((int) devcfg::cur.mode);
+  out += ",\"trial\":" + std::to_string((unsigned) devcfg::trial_left_s());
   if (linked) out += ",\"peer_role\":\"" + json_escape(peer_role) + "\"";
   if (extra_status) out += "," + extra_status();
   if (device_kind == "screen" && peer_status_lock != nullptr &&
@@ -2747,6 +2815,98 @@ static esp_err_t h_ft_cancel(httpd_req_t *req) {
   return reply_msg(req, "Тест остановлен");
 }
 
+
+// ---- Device settings (mode, manual neighbour) with trial apply ----
+inline bool valid_ipv4(const std::string &s) {
+  if (s.empty() || s.size() > 15) return false;
+  int parts = 0, val = 0, digits = 0;
+  for (size_t i = 0; i <= s.size(); i++) {
+    if (i == s.size() || s[i] == '.') {
+      if (digits == 0 || val > 255) return false;
+      parts++; val = 0; digits = 0;
+    } else if (s[i] >= '0' && s[i] <= '9') {
+      val = val * 10 + (s[i] - '0'); digits++;
+      if (digits > 3) return false;
+    } else {
+      return false;
+    }
+  }
+  return parts == 4;
+}
+
+inline bool valid_mac(const std::string &s) {
+  if (s.size() != 17) return false;
+  for (size_t i = 0; i < 17; i++) {
+    const char c = s[i];
+    if (i % 3 == 2) { if (c != ':') return false; }
+    else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return false;
+  }
+  return true;
+}
+
+inline std::string devcfg_json() {
+  const devcfg::Values &v = devcfg::cur;
+  return std::string("{\"ok\":true,\"mode\":") + std::to_string((int) v.mode) + ",\"kind\":\"" + device_kind +
+         "\",\"peer_ip\":\"" + json_escape(v.peer_ip) + "\",\"peer_mac\":\"" + json_escape(v.peer_mac) +
+         "\",\"peer_role\":\"" + json_escape(v.peer_role) + "\",\"trial\":" +
+         std::to_string((unsigned) devcfg::trial_left_s()) + ",\"trial_total\":" + std::to_string((unsigned) devcfg::kTrialS) +
+         ",\"fw\":\"" + kFwVersion + "\"}";
+}
+
+static esp_err_t h_devcfg_get(httpd_req_t *req) {
+  const std::string s = devcfg_json();
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  return httpd_resp_send(req, s.c_str(), s.size());
+}
+
+static esp_err_t h_devcfg_set(httpd_req_t *req) {
+  std::string b;
+  if (recv_body(req, b, 200) < 0) return reply_err(req, "Ошибка запроса");
+  devcfg::Values nv = devcfg::cur;
+  const std::string mode = form_value(b, "mode");
+  if (!mode.empty()) {
+    if (mode != "0" && mode != "1") return reply_err(req, "Неверный режим");
+    nv.mode = (uint8_t) (mode == "1" ? 1 : 0);
+  }
+  if (b.find("peer_ip=") != std::string::npos) {
+    const std::string ip = form_value(b, "peer_ip");
+    if (!ip.empty() && !valid_ipv4(ip)) return reply_err(req, "Неверный IP соседа (нужен вид 192.168.1.20)");
+    snprintf(nv.peer_ip, sizeof(nv.peer_ip), "%s", ip.c_str());
+    const std::string mac = form_value(b, "peer_mac");
+    if (!mac.empty() && !valid_mac(mac)) return reply_err(req, "Неверный MAC соседа (нужен вид AA:BB:CC:DD:EE:FF)");
+    snprintf(nv.peer_mac, sizeof(nv.peer_mac), "%s", mac.c_str());
+    const std::string role = form_value(b, "peer_role");
+    if (!role.empty() && role != "scale" && role != "screen") return reply_err(req, "Неверная роль соседа");
+    if (role == device_kind) return reply_err(req, "Роль соседа должна отличаться от роли этого устройства");
+    snprintf(nv.peer_role, sizeof(nv.peer_role), "%s", role.c_str());
+  }
+  if (nv.mode == devcfg::cur.mode && strcmp(nv.peer_ip, devcfg::cur.peer_ip) == 0 &&
+      strcmp(nv.peer_mac, devcfg::cur.peer_mac) == 0 && strcmp(nv.peer_role, devcfg::cur.peer_role) == 0) {
+    return reply_msg(req, "Без изменений");
+  }
+  devcfg::apply_trial(nv);
+  home_peer_ip.clear();  // search again with the new record
+  bb::key("CFG", "applied on trial mode=%d peer_ip=%s peer_role=%s (rollback in %us)", (int) nv.mode,
+          nv.peer_ip[0] ? nv.peer_ip : "-", nv.peer_role[0] ? nv.peer_role : "-", (unsigned) devcfg::kTrialS);
+  set_status("Настройки применены пробно: подтвердите в течение 3 минут");
+  return reply_msg(req, "Применено пробно. Подтвердите в течение 3 минут, иначе вернутся прежние");
+}
+
+static esp_err_t h_devcfg_confirm(httpd_req_t *req) {
+  devcfg::confirm();
+  bb::key("CFG", "confirmed");
+  set_status("Настройки подтверждены");
+  return reply_msg(req, "Настройки подтверждены");
+}
+
+static esp_err_t h_devcfg_revert(httpd_req_t *req) {
+  devcfg::revert();
+  home_peer_ip.clear();
+  bb::key("CFG", "reverted by user");
+  set_status("Прежние настройки возвращены");
+  return reply_msg(req, "Прежние настройки возвращены");
+}
+
 // ---- Black box: sampler task and download endpoints ----
 // One compact line every 30 s: memory, role, link, signal. Enough to see trends, not a flood.
 inline void bb_sampler_task(void *) {
@@ -2842,10 +3002,17 @@ inline void start(int port) {
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port = port;
   // По умолчанию 8 обработчиков; у нас 12 маршрутов, лишние тихо отбрасывались (404)
-  cfg.max_uri_handlers = 36;
+  cfg.max_uri_handlers = 40;
   // Сокетов в системе мало (общий пул LWIP): страницы, опрос соседа, API ESPHome и панель делят его.
   // При нехватке закрываем самое давнее неактивное соединение вместо отказа новым (accept error 23).
   cfg.lru_purge_enable = true;
+  // TCP_NODELAY on accepted sockets: the reply goes out as header + body in separate segments; with Nagle the
+  // second one waits for the peer's delayed ACK (~200 ms), which is why every neighbour probe took ~250 ms.
+  cfg.open_fn = [](httpd_handle_t, int fd) -> esp_err_t {
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    return ESP_OK;
+  };
   cfg.max_open_sockets = 6;
   // web_server ESPHome больше не используется, но порт управления оставляем отдельным
   cfg.ctrl_port = 32769;
@@ -2880,6 +3047,18 @@ inline void start(int port) {
     evlog('e', "cannot create peer status mutex");
   }
 
+  u = {};
+  u.uri = "/devcfg"; u.method = HTTP_GET; u.handler = h_devcfg_get;
+  reg_uri(srv, u);
+  u = {};
+  u.uri = "/devcfg"; u.method = HTTP_POST; u.handler = h_devcfg_set;
+  reg_uri(srv, u);
+  u = {};
+  u.uri = "/devcfg_confirm"; u.method = HTTP_POST; u.handler = h_devcfg_confirm;
+  reg_uri(srv, u);
+  u = {};
+  u.uri = "/devcfg_revert"; u.method = HTTP_POST; u.handler = h_devcfg_revert;
+  reg_uri(srv, u);
   u = {};
   u.uri = "/ft_start"; u.method = HTTP_POST; u.handler = h_ft_start;
   reg_uri(srv, u);

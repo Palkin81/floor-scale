@@ -15,6 +15,7 @@ substitutions:
 esphome:
   includes:
     - lib/blackbox.h
+    - lib/devcfg.h
     - lib/prov_crypto.h
     - lib/prov_link.h
     - lib/wifi_probe.h
@@ -26,6 +27,14 @@ esphome:
     then:
       - lambda: |-
           bb::begin();
+          if (devcfg::begin()) {
+            // Three quick power-on boots in a row: back to a known state (settings and saved network).
+            bb::key("RST", "3 quick power boots: settings and saved network reset");
+            devcfg::reset_all();
+            netrole::clear_saved_sta(id(wifi_comp));
+            id(wifi_comp)->clear_sta();
+            App.reboot();
+          }
           netrole::start_logging();
           ui::prov_key = "${prov_key_b64}";
           ui::setup_ssid = "${prov_ssid}";
@@ -139,6 +148,10 @@ interval:
   - interval: 10s
     then:
       - lambda: |-
+          if (devcfg::tick((uint32_t) (esp_timer_get_time() / 1000000))) {
+            bb::key("CFG", "trial expired, previous settings restored");
+            ui::home_peer_ip.clear();
+          }
           static uint32_t lost_since = 0;
           static uint32_t last_diag = 0;
           std::string saved;
