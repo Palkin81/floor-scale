@@ -53,7 +53,7 @@ inline std::string setup_ssid;
 inline constexpr int kProto = 1;
 // Code version: bumped by hand with every change, so the page and the black box show which code is on the device.
 // (ESPHome build time is NOT the compile time: with reproducible builds it only changes with the config.)
-inline constexpr const char *kFwVersion = "12.1.0";
+inline constexpr const char *kFwVersion = "12.1.1";
 inline int peer_proto = -1;                 // версия протокола соседа по последнему ответу, -1 = нет данных
 inline std::string peer_host;
 inline std::function<void(const std::string &, const std::string &)> on_creds;
@@ -97,6 +97,7 @@ inline std::string peer_data;              // последний ответ /sta
 inline uint32_t peer_data_at = 0;          // когда получен, мс
 inline volatile int ft_phase = 0;          // полный тест: 0 нет, 1 этап A, 2 ждём домашнюю сеть, 3 этап B
 inline uint32_t link_down_total = 0;       // сколько раз связь с соседом была потеряна (для полного теста)
+inline int sockets_in_use();               // определена ниже, нужна журналу сбоев опроса
 inline int peer_misses = 0;                // подряд пропущенных проверок связи
 
 // ---- устройство ----
@@ -1357,9 +1358,14 @@ inline bool probe_peer(std::string &peer_role) {
       probe_ip = devcfg::cur.peer_ip;
       return true;
     }
-    if (!home_peer_ip.empty() && read_identity(home_peer_ip, expected, peer_role)) {
-      probe_ip = home_peer_ip;
-      return true;
+    // Слабый сигнал теряет отдельные пакеты: пробуем запомненный адрес до трёх раз, прежде чем
+    // идти в mDNS (он теряется чаще и даёт простои по 40-115 с). Адрес не стираем при неудаче.
+    for (int attempt = 0; attempt < 3 && !home_peer_ip.empty(); attempt++) {
+      if (read_identity(home_peer_ip, expected, peer_role)) {
+        probe_ip = home_peer_ip;
+        return true;
+      }
+      vTaskDelay(pdMS_TO_TICKS(300));
     }
     std::string ip;
     // Сначала поиск по сервису (не зависит от имени хоста), потом по имени хоста
@@ -1369,7 +1375,6 @@ inline bool probe_peer(std::string &peer_role) {
       probe_ip = ip;
       return true;
     }
-    home_peer_ip.clear();
     probe_why = "home_lookup";
     return false;
   }
@@ -1538,8 +1543,11 @@ inline void peer_data_task(void *) {
       pd_fail_total++;
       if (streak == 0) {
         streak_start_s = up_s;
-        bb::key("PDATA", "FAIL why=%s err=%s http=%d ip=%s since_ok=%lus", why, esp_err_to_name((esp_err_t) err),
-                http, ip.empty() ? "-" : ip.c_str(), (unsigned long) (up_s - last_ok_s));
+        wifi_ap_record_t ap_rec = {};
+        const int rssi_now = esp_wifi_sta_get_ap_info(&ap_rec) == ESP_OK ? (int) ap_rec.rssi : 0;
+        bb::key("PDATA", "FAIL why=%s err=%s http=%d ip=%s since_ok=%lus sk=%d rssi=%d", why,
+                esp_err_to_name((esp_err_t) err), http, ip.empty() ? "-" : ip.c_str(),
+                (unsigned long) (up_s - last_ok_s), sockets_in_use(), rssi_now);
       }
       streak++;
     }
