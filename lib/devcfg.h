@@ -34,6 +34,9 @@ inline bool quick_pending = false;  // quick-boot counter is non-zero and still 
 
 inline uint32_t ms() { return (uint32_t) (esp_timer_get_time() / 1000); }
 
+// Simple mode (mode 1): the device works alone. No neighbour search, no role election, no polling.
+inline bool simple() { return cur.mode == 1; }
+
 inline void save_all() {
   if (!ready) return;
   nvs_set_blob(h, "v", &cur, sizeof(cur));

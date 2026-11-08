@@ -163,7 +163,7 @@ interval:
           const uint32_t now_s = (uint32_t) (esp_timer_get_time() / 1000000);
           // The timer is reset only by a real STA link; short glitches of the other flags (the STA is
           // restarted every ~7 s during ESPHome retries) must not restart the countdown.
-          if (sta_up || !rs || (has_saved && !setup_saved)) {
+          if (sta_up || !rs || devcfg::simple() || (has_saved && !setup_saved)) {
             lost_since = 0;
           } else if (setup_saved) {
             if (lost_since == 0) lost_since = now_s ? now_s : 1;
@@ -196,7 +196,16 @@ script:
                 uint8_t found[6] = {0};
                 const bool has_saved_sta = netrole::saved_sta(saved);
                 const bool saved_setup_sta = has_saved_sta && saved == "${prov_ssid}";
-                if (netrole::own_ap_active() && ui::peer_link_state && (!has_saved_sta || saved_setup_sta)) {
+                if (devcfg::simple()) {
+                  // Простой режим: соседа не ищем, роли не согласуем. Сохранённая домашняя сеть остаётся,
+                  // сеть настройки (след прежней пары) убираем, чтобы устройство поднялось само по себе.
+                  if (saved_setup_sta) {
+                    netrole::clear_saved_sta(id(wifi_comp));
+                    id(wifi_comp)->clear_sta();
+                  }
+                  bb::key("ROLE", "simple mode: no neighbour search (%s)", has_saved_sta && !saved_setup_sta ? "home sta kept" : "own AP");
+                  id(role_selected) = true;
+                } else if (netrole::own_ap_active() && ui::peer_link_state && (!has_saved_sta || saved_setup_sta)) {
                   // The neighbour already joined our AP (it introduced itself): we are the master.
                   // Another scan would only hop channels and drop clients (a phone was kicked at t64).
                   // ESPHome keeps retrying a configured STA network next to the fallback AP (sta_disc 201

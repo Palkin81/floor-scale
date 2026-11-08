@@ -53,7 +53,7 @@ inline std::string setup_ssid;
 inline constexpr int kProto = 1;
 // Code version: bumped by hand with every change, so the page and the black box show which code is on the device.
 // (ESPHome build time is NOT the compile time: with reproducible builds it only changes with the config.)
-inline constexpr const char *kFwVersion = "12.1.1";
+inline constexpr const char *kFwVersion = "12.2.0";
 inline int peer_proto = -1;                 // версия протокола соседа по последнему ответу, -1 = нет данных
 inline std::string peer_host;
 inline std::function<void(const std::string &, const std::string &)> on_creds;
@@ -476,7 +476,7 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <p class="hint" id="m-trial" style="margin:0 0 14px;font-weight:600" hidden></p>
 <h2 style="margin-top:6px">Режим</h2>
 <div class="glass card">
-<p class="hint" style="margin:0 0 12px">«С удалённым экраном»: весы и экран работают парой. «Простой»: устройство работает само, без соседа (режим подключается в следующем обновлении, сейчас значение только сохраняется).</p>
+<p class="hint" style="margin:0 0 12px">«С удалённым экраном»: весы и экран работают парой. «Простой»: устройство работает само: соседа не ищет, роли и сеть с ним не согласует, опрос и полный тест отключены. Когда вы подтвердите смену режима, устройство перезагрузится.</p>
 <div class="stack">
 <select class="inp" id="m-mode" aria-label="Режим работы"><option value="0">С удалённым экраном</option><option value="1">Простой</option></select>
 </div>
@@ -749,9 +749,10 @@ s.split(' | ').forEach((p,i)=>box.append(el('span','pill',i===0?p.replace('но�
 }
 function render(j){
 isScale=j.kind==='scale';
+const simple=(j.mode|0)===1;
 {const ft=j.ft|0,m=['Тест не запущен','Идёт этап A (текущая сеть), около 1,5 минуты','Этап A готов. Подключите оба устройства к домашней сети в разделе «Сеть»: тест продолжится сам','Идёт этап B (домашняя сеть), около 1,5 минуты'];
-txt('l-mode',(j.trial|0)>0?'ждёт подтверждения':'');
-txt('ft-state',m[ft]||m[0]);$('ft-start').disabled=ft!==0||!j.peer_link;$('ft-cancel').disabled=ft===0;}
+txt('l-mode',(j.trial|0)>0?'ждёт подтверждения':(simple?'простой':''));
+txt('ft-state',simple&&ft===0?'Недоступно в простом режиме: нужен сосед':(m[ft]||m[0]));$('ft-start').disabled=simple||ft!==0||!j.peer_link;$('ft-cancel').disabled=ft===0;}
 W=isScale?j:(j.scale||null);
 if(!ready){ready=true;go(location.hash.slice(1))}
 const title=j.title||'Floor Scale';txt('title',title);if(document.title!==title)document.title=title;
@@ -763,17 +764,18 @@ if(!j.peer_checked){c='wait';t='Проверка связи';peer='Провер�
 else if(j.peer_link){c='ok';t='Связь есть';peer='Подключено — '+(j.peer_role||'сосед');main='на связи'}
 else{c='bad';t='Нет связи';peer='Нет связи';main='не найдены'}
 }
+if(simple){c='';t='Простой режим';peer='Не используется';main='не нужна'}
 chip(c,t);
 // главная: вес (свой или от весов через экран) и кратко связь с калибровкой
 vis('hero-w',!!W);vis('hero-off',!W);
 if(W){txt('live',num(W.live));txt('c-live',num(W.live));txt('res',W.result==null?'нет данных':num(W.result)+' кг')}
 else{
 txt('c-live','—');
-txt('ho-main',j.peer_applicable&&j.peer_checked&&j.peer_link?'Ждём данные весов…':'Весы не на связи');
-txt('ho-sub',j.peer_applicable&&j.peer_checked&&j.peer_link?'Весы нашлись, данные ещё не пришли.':'Вес и калибровка появятся, когда экран найдёт весы.');
+txt('ho-main',simple?'Режим «Простой»':(j.peer_applicable&&j.peer_checked&&j.peer_link?'Ждём данные весов…':'Весы не на связи'));
+txt('ho-sub',simple?'Это устройство работает само и весов не ищет. Чтобы показывать вес с весов, выберите режим «С удалённым экраном» в разделе «Система → Режим и роль».':(j.peer_applicable&&j.peer_checked&&j.peer_link?'Весы нашлись, данные ещё не пришли.':'Вес и калибровка появятся, когда экран найдёт весы.'));
 }
 txt('h-peer-lab','Связь: '+peerName.toLowerCase());
-txt('h-peer',j.peer_applicable?(j.peer_checked?(j.peer_link?'Есть':'Нет'):'Проверка…'):'—');
+txt('h-peer',simple?'Не нужна':(j.peer_applicable?(j.peer_checked?(j.peer_link?'Есть':'Нет'):'Проверка…'):'—'));
 const cs=W&&W.curve;
 const npts=cs&&cs.indexOf('нет точек')!==0?cs.split(' | ').length-1:0;
 txt('h-cal',!W?'—':npts?npts+' '+(npts===1?'точка':npts<5?'точки':'точек'):'линейно');
@@ -991,7 +993,7 @@ const j=await post('/devcfg',{mode:$('m-mode').value,peer_ip:$('m-ip').value.tri
 say(j.msg,!j.ok);loadMode();
 }catch(e){say('Нет связи с устройством')}
 };
-$('m-confirm').onclick=async()=>{try{const j=await post('/devcfg_confirm');say(j.msg);loadMode()}catch(e){say('Нет связи с устройством')}};
+$('m-confirm').onclick=async()=>{try{const j=await post('/devcfg_confirm');say(j.msg);if(j.reboot)return;loadMode()}catch(e){say('Нет связи с устройством')}};
 $('m-revert').onclick=async()=>{try{const j=await post('/devcfg_revert');say(j.msg);loadMode()}catch(e){say('Нет связи с устройством')}};
 async function loadFw(){
 try{
@@ -1440,9 +1442,10 @@ inline void peer_monitor_task(void *) {
   while (true) {
     std::string role;
     const std::string own_role = local_role();
-    const bool applicable = own_role == "Клиент (слейв)" ||
+    // Простой режим: соседа не ищем и не ждём, поэтому «нет связи» не считается сбоем.
+    const bool applicable = !devcfg::simple() && (own_role == "Клиент (слейв)" ||
                             own_role == "Точка доступа (мастер)" ||
-                            own_role == "Домашняя сеть";
+                            own_role == "Домашняя сеть");
     announce_service();
     const bool linked = applicable && probe_peer(role);
     {
@@ -1509,6 +1512,10 @@ inline void peer_data_task(void *) {
   const std::string kind_field = "\"kind\":\"" + expected + "\"";
   uint32_t streak = 0, streak_start_s = 0, last_ok_s = 0;
   while (true) {
+    if (devcfg::simple()) {  // простой режим: данные соседа не нужны
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      continue;
+    }
     std::string ip;
     const uint32_t up_s = (uint32_t) (esp_timer_get_time() / 1000000);
     bool ok = false;
@@ -2793,6 +2800,7 @@ static esp_err_t h_ft_start(httpd_req_t *req) {
   std::string b;
   if (req->content_len > 0 && recv_body(req, b, 60) < 0) return reply_msg(req, "Ошибка запроса");
   const bool relay = form_value(b, "relay") == "1";
+  if (devcfg::simple()) return reply_msg(req, "Недоступно в простом режиме: полному тесту нужен сосед");
   if (ft_phase != 0) return reply_msg(req, "Тест уже идёт");
   ft_set(1);
   bb::key("FT", "START %s role=%s build=%s", relay ? "by neighbor" : "by user", role_code(), bb::build.c_str());
@@ -2901,8 +2909,18 @@ static esp_err_t h_devcfg_set(httpd_req_t *req) {
 }
 
 static esp_err_t h_devcfg_confirm(httpd_req_t *req) {
+  // Роль выбирается при загрузке, поэтому смена режима вступает в силу после перезагрузки.
+  const bool mode_changed = devcfg::trial && devcfg::prev.mode != devcfg::cur.mode;
   devcfg::confirm();
-  bb::key("CFG", "confirmed");
+  bb::key("CFG", "confirmed mode=%d%s", (int) devcfg::cur.mode, mode_changed ? " (mode changed, rebooting)" : "");
+  if (mode_changed && on_reboot) {
+    set_status("Режим изменён, устройство перезагружается");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"reboot\":true,\"msg\":\"Режим изменён, устройство перезагружается\"}");
+    vTaskDelay(pdMS_TO_TICKS(250));
+    on_reboot();
+    return ESP_OK;
+  }
   set_status("Настройки подтверждены");
   return reply_msg(req, "Настройки подтверждены");
 }

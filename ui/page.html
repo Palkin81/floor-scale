@@ -290,7 +290,7 @@ h2{margin:24px 8px 10px;font-size:13px;font-weight:600;letter-spacing:.06em;text
   <p class="hint" id="m-trial" style="margin:0 0 14px;font-weight:600" hidden></p>
   <h2 style="margin-top:6px">Режим</h2>
   <div class="glass card">
-    <p class="hint" style="margin:0 0 12px">«С удалённым экраном»: весы и экран работают парой. «Простой»: устройство работает само, без соседа (режим подключается в следующем обновлении, сейчас значение только сохраняется).</p>
+    <p class="hint" style="margin:0 0 12px">«С удалённым экраном»: весы и экран работают парой. «Простой»: устройство работает само: соседа не ищет, роли и сеть с ним не согласует, опрос и полный тест отключены. Когда вы подтвердите смену режима, устройство перезагрузится.</p>
     <div class="stack">
       <select class="inp" id="m-mode" aria-label="Режим работы"><option value="0">С удалённым экраном</option><option value="1">Простой</option></select>
     </div>
@@ -573,9 +573,10 @@ function renderCurve(s){
 }
 function render(j){
   isScale=j.kind==='scale';
+  const simple=(j.mode|0)===1;
   {const ft=j.ft|0,m=['Тест не запущен','Идёт этап A (текущая сеть), около 1,5 минуты','Этап A готов. Подключите оба устройства к домашней сети в разделе «Сеть»: тест продолжится сам','Идёт этап B (домашняя сеть), около 1,5 минуты'];
-  txt('l-mode',(j.trial|0)>0?'ждёт подтверждения':'');
-  txt('ft-state',m[ft]||m[0]);$('ft-start').disabled=ft!==0||!j.peer_link;$('ft-cancel').disabled=ft===0;}
+  txt('l-mode',(j.trial|0)>0?'ждёт подтверждения':(simple?'простой':''));
+  txt('ft-state',simple&&ft===0?'Недоступно в простом режиме: нужен сосед':(m[ft]||m[0]));$('ft-start').disabled=simple||ft!==0||!j.peer_link;$('ft-cancel').disabled=ft===0;}
   W=isScale?j:(j.scale||null);
   if(!ready){ready=true;go(location.hash.slice(1))}
   const title=j.title||'Floor Scale';txt('title',title);if(document.title!==title)document.title=title;
@@ -587,17 +588,18 @@ function render(j){
     else if(j.peer_link){c='ok';t='Связь есть';peer='Подключено — '+(j.peer_role||'сосед');main='на связи'}
     else{c='bad';t='Нет связи';peer='Нет связи';main='не найдены'}
   }
+  if(simple){c='';t='Простой режим';peer='Не используется';main='не нужна'}
   chip(c,t);
   // главная: вес (свой или от весов через экран) и кратко связь с калибровкой
   vis('hero-w',!!W);vis('hero-off',!W);
   if(W){txt('live',num(W.live));txt('c-live',num(W.live));txt('res',W.result==null?'нет данных':num(W.result)+' кг')}
   else{
     txt('c-live','—');
-    txt('ho-main',j.peer_applicable&&j.peer_checked&&j.peer_link?'Ждём данные весов…':'Весы не на связи');
-    txt('ho-sub',j.peer_applicable&&j.peer_checked&&j.peer_link?'Весы нашлись, данные ещё не пришли.':'Вес и калибровка появятся, когда экран найдёт весы.');
+    txt('ho-main',simple?'Режим «Простой»':(j.peer_applicable&&j.peer_checked&&j.peer_link?'Ждём данные весов…':'Весы не на связи'));
+    txt('ho-sub',simple?'Это устройство работает само и весов не ищет. Чтобы показывать вес с весов, выберите режим «С удалённым экраном» в разделе «Система → Режим и роль».':(j.peer_applicable&&j.peer_checked&&j.peer_link?'Весы нашлись, данные ещё не пришли.':'Вес и калибровка появятся, когда экран найдёт весы.'));
   }
   txt('h-peer-lab','Связь: '+peerName.toLowerCase());
-  txt('h-peer',j.peer_applicable?(j.peer_checked?(j.peer_link?'Есть':'Нет'):'Проверка…'):'—');
+  txt('h-peer',simple?'Не нужна':(j.peer_applicable?(j.peer_checked?(j.peer_link?'Есть':'Нет'):'Проверка…'):'—'));
   const cs=W&&W.curve;
   const npts=cs&&cs.indexOf('нет точек')!==0?cs.split(' | ').length-1:0;
   txt('h-cal',!W?'—':npts?npts+' '+(npts===1?'точка':npts<5?'точки':'точек'):'линейно');
@@ -821,7 +823,7 @@ $('m-save').onclick=async()=>{
     say(j.msg,!j.ok);loadMode();
   }catch(e){say('Нет связи с устройством')}
 };
-$('m-confirm').onclick=async()=>{try{const j=await post('/devcfg_confirm');say(j.msg);loadMode()}catch(e){say('Нет связи с устройством')}};
+$('m-confirm').onclick=async()=>{try{const j=await post('/devcfg_confirm');say(j.msg);if(j.reboot)return;loadMode()}catch(e){say('Нет связи с устройством')}};
 $('m-revert').onclick=async()=>{try{const j=await post('/devcfg_revert');say(j.msg);loadMode()}catch(e){say('Нет связи с устройством')}};
 async function loadFw(){
   try{
