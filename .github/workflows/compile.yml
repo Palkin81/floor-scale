@@ -35,7 +35,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        config: [floor-scale.yaml, screen_stub.yaml]
+        include:
+          - {config: floor-scale.yaml, board: seeed_xiao_esp32c6}
+          - {config: floor-scale-esp32.yaml, board: esp32dev}
+          - {config: screen_stub.yaml, board: esp32dev}
+          - {config: screen_stub_c6.yaml, board: seeed_xiao_esp32c6}
     steps:
       - uses: actions/checkout@v4
 
@@ -68,7 +72,10 @@ jobs:
           } > secrets.yaml
 
       - name: Проверка конфигурации
-        run: esphome config ${{ matrix.config }} > /dev/null
+        run: |
+          esphome config ${{ matrix.config }} > resolved.txt
+          # Плата из входного файла должна дойти до итоговой конфигурации (а не потеряться при слиянии пакетов)
+          grep -qE "board: ${{ matrix.board }}\b" resolved.txt || { echo "::error::В итоговой конфигурации нет board: ${{ matrix.board }}"; grep -n "board:" resolved.txt; exit 1; }
 
       - name: Сборка
         shell: bash
@@ -118,7 +125,8 @@ jobs:
             } > $d/secrets.yaml
           done
           esc() { sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}'; }
-          for f in floor-scale screen_stub; do
+          for f in floor-scale floor-scale-esp32 screen_stub screen_stub_c6; do
+            [ -f old/$f.yaml ] || { echo "::notice title=$f.yaml::нового файла в main ещё нет, сравнивать не с чем"; continue; }
             (cd old && esphome config $f.yaml > ../$f.old.txt 2>&1)
             (cd new && esphome config $f.yaml > ../$f.new.txt 2>&1)
             diff -u $f.old.txt $f.new.txt > $f.diff || true

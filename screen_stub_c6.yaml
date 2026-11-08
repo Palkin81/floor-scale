@@ -1,0 +1,17 @@
+# Экран на XIAO ESP32-C6 (тот же код, другая плата).
+# Логика общая: packages/common.yaml и packages/screen.yaml; здесь только плата.
+substitutions:
+  board: seeed_xiao_esp32c6
+  esp_variant: esp32c6
+
+packages:
+  common: !include packages/common.yaml
+  screen: !include packages/screen.yaml
+
+esphome:
+  name: floor-screen
+  friendly_name: screen
+
+esp32:
+  board: ${board}
+  variant: ${esp_variant}

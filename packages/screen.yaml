@@ -1,0 +1,19 @@
+# Общая часть ЭКРАНА (заглушка, пока без дисплея) для любой платы.
+# Подключается из входного файла платы вместе с packages/common.yaml. Во входном файле заданы:
+#   substitutions: board, esp_variant;
+#   esphome: name, friendly_name; раздел esp32 (board, variant).
+# Входные файлы: screen_stub.yaml (ESP32 DevKit), screen_stub_c6.yaml (XIAO ESP32-C6).
+
+substitutions:
+  ap_ip: "192.168.4.1"      # общий адрес точки (проверка варианта C, см. снимок)
+
+script:
+  - id: device_setup
+    then:
+      - lambda: |-
+          ui::peer_host = "floor-scale.local";
+
+sensor:
+  - platform: wifi_signal
+    name: signal
+    update_interval: 30s

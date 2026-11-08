@@ -53,7 +53,7 @@ inline std::string setup_ssid;
 inline constexpr int kProto = 1;
 // Code version: bumped by hand with every change, so the page and the black box show which code is on the device.
 // (ESPHome build time is NOT the compile time: with reproducible builds it only changes with the config.)
-inline constexpr const char *kFwVersion = "12.2.1";
+inline constexpr const char *kFwVersion = "12.3.0";
 inline int peer_proto = -1;                 // версия протокола соседа по последнему ответу, -1 = нет данных
 inline std::string peer_host;
 inline std::function<void(const std::string &, const std::string &)> on_creds;
@@ -483,11 +483,12 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 </div>
 <h2>Роль этого устройства</h2>
 <div class="glass card">
-<p class="hint" style="margin:0 0 12px">Роль определяется прошивкой. Переключение роли станет доступно после объединения прошивок (этап унификации).</p>
+<p class="hint" style="margin:0 0 12px">Роль задаёт файл сборки платы: весы (floor-scale*.yaml) или экран (screen_stub*.yaml). Логика одна и та же на ESP32-C6 и ESP32; чтобы поменять роль, прошейте устройство другим файлом.</p>
 <div class="stack">
 <select class="inp" id="m-role" disabled aria-label="Роль этого устройства"><option value="scale">Весы</option><option value="screen">Экран</option></select>
 </div>
-<p class="hint" id="m-hx" style="margin:12px 0 0"></p>
+<p class="hint" id="m-board" style="margin:12px 0 0"></p>
+<p class="hint" id="m-hx" style="margin:6px 0 0"></p>
 </div>
 <h2>Сосед (вручную)</h2>
 <div class="glass card">
@@ -756,6 +757,7 @@ s.split(' | ').forEach((p,i)=>box.append(el('span','pill',i===0?p.replace('но�
 function render(j){
 isScale=j.kind==='scale';
 const simple=(j.mode|0)===1;
+if(j.chip)txt('m-board','Плата: '+j.chip+'. Прошивка собрана как '+(isScale?'весы':'экран')+'.');
 if(j.hx!==undefined){const hx=j.hx|0,hz=((j.hx_dhz|0)/10).toFixed(1).replace('.',',');
 txt('m-hx',['Датчик HX711: в этой прошивке его нет. Это подсказка, роль вы выбираете сами.','Датчик HX711: данных нет, он не подключён или не отвечает. Это подсказка, роль вы выбираете сами.','Датчик HX711: отвечает ('+hz+' Гц). Это подсказка, роль вы выбираете сами.','Датчик HX711: значения не меняются, проверьте провода и питание.','Датчик HX711: значение упёрлось в предел, проверьте тензодатчик и провода.'][hx]||'')}
 {const ft=j.ft|0,m=['Тест не запущен','Идёт этап A (текущая сеть), около 1,5 минуты','Этап A готов. Подключите оба устройства к домашней сети в разделе «Сеть»: тест продолжится сам','Идёт этап B (домашняя сеть), около 1,5 минуты'];
@@ -1576,6 +1578,8 @@ inline std::string identity_json() {
 }
 
 // Состояние сети и отдельная проверка доступности именно второго устройства.
+inline const char *chip_name();  // определена ниже, рядом с обновлением прошивки
+
 inline std::string status_json() {
   std::string network = "нет", signal = "нет", ip = "нет", connected_ssid;
   wifi_ap_record_t ap = {};
@@ -1623,6 +1627,7 @@ inline std::string status_json() {
   out += std::string(",\"peer_link\":") + (linked ? "true" : "false");
   out += ",\"ft\":" + std::to_string((int) ft_phase);
   out += ",\"mode\":" + std::to_string((int) devcfg::cur.mode);
+  out += std::string(",\"chip\":\"") + json_escape(chip_name()) + "\"";
   out += ",\"hx\":" + std::to_string(hxdet::code());
   out += ",\"hx_dhz\":" + std::to_string(hxdet::rate_dhz());
   out += ",\"trial\":" + std::to_string((unsigned) devcfg::trial_left_s());
