@@ -16,6 +16,7 @@ esphome:
   includes:
     - lib/blackbox.h
     - lib/devcfg.h
+    - lib/hxdet.h
     - lib/prov_crypto.h
     - lib/prov_link.h
     - lib/wifi_probe.h

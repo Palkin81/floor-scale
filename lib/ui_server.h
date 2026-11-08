@@ -53,7 +53,7 @@ inline std::string setup_ssid;
 inline constexpr int kProto = 1;
 // Code version: bumped by hand with every change, so the page and the black box show which code is on the device.
 // (ESPHome build time is NOT the compile time: with reproducible builds it only changes with the config.)
-inline constexpr const char *kFwVersion = "12.2.0";
+inline constexpr const char *kFwVersion = "12.2.1";
 inline int peer_proto = -1;                 // версия протокола соседа по последнему ответу, -1 = нет данных
 inline std::string peer_host;
 inline std::function<void(const std::string &, const std::string &)> on_creds;
@@ -487,6 +487,7 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <div class="stack">
 <select class="inp" id="m-role" disabled aria-label="Роль этого устройства"><option value="scale">Весы</option><option value="screen">Экран</option></select>
 </div>
+<p class="hint" id="m-hx" style="margin:12px 0 0"></p>
 </div>
 <h2>Сосед (вручную)</h2>
 <div class="glass card">
@@ -584,6 +585,11 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <h3 style="margin:0 0 6px">Экспорт настроек</h3>
 <p class="hint" style="margin:0 0 12px">Собирает файл настроек в памяти, шифрует и расшифровывает его и пишет в журнал, что в нём есть (сеть, калибровка) и размер. Пароли в журнал не пишутся.</p>
 <button class="btn" data-test="export">Проверить экспорт</button>
+</div>
+<div class="glass card">
+<h3 style="margin:0 0 6px">Датчик HX711</h3>
+<p class="hint" style="margin:0 0 12px">Тест 30 секунд: раз в секунду проверяет подсказку «датчик подключён» и пишет в чёрный ящик, не прыгает ли она. Запустите дважды: с подключённым датчиком и с отключённым; подсказка должна совпасть с действительностью. На устройстве без HX711 тест пропускается.</p>
+<button class="btn" data-test="hx">Проверить датчик</button>
 </div>
 </section>
 </main>
@@ -750,6 +756,8 @@ s.split(' | ').forEach((p,i)=>box.append(el('span','pill',i===0?p.replace('но�
 function render(j){
 isScale=j.kind==='scale';
 const simple=(j.mode|0)===1;
+if(j.hx!==undefined){const hx=j.hx|0,hz=((j.hx_dhz|0)/10).toFixed(1).replace('.',',');
+txt('m-hx',['Датчик HX711: в этой прошивке его нет. Это подсказка, роль вы выбираете сами.','Датчик HX711: данных нет, он не подключён или не отвечает. Это подсказка, роль вы выбираете сами.','Датчик HX711: отвечает ('+hz+' Гц). Это подсказка, роль вы выбираете сами.','Датчик HX711: значения не меняются, проверьте провода и питание.','Датчик HX711: значение упёрлось в предел, проверьте тензодатчик и провода.'][hx]||'')}
 {const ft=j.ft|0,m=['Тест не запущен','Идёт этап A (текущая сеть), около 1,5 минуты','Этап A готов. Подключите оба устройства к домашней сети в разделе «Сеть»: тест продолжится сам','Идёт этап B (домашняя сеть), около 1,5 минуты'];
 txt('l-mode',(j.trial|0)>0?'ждёт подтверждения':(simple?'простой':''));
 txt('ft-state',simple&&ft===0?'Недоступно в простом режиме: нужен сосед':(m[ft]||m[0]));$('ft-start').disabled=simple||ft!==0||!j.peer_link;$('ft-cancel').disabled=ft===0;}
@@ -1615,6 +1623,8 @@ inline std::string status_json() {
   out += std::string(",\"peer_link\":") + (linked ? "true" : "false");
   out += ",\"ft\":" + std::to_string((int) ft_phase);
   out += ",\"mode\":" + std::to_string((int) devcfg::cur.mode);
+  out += ",\"hx\":" + std::to_string(hxdet::code());
+  out += ",\"hx_dhz\":" + std::to_string(hxdet::rate_dhz());
   out += ",\"trial\":" + std::to_string((unsigned) devcfg::trial_left_s());
   if (linked) out += ",\"peer_role\":\"" + json_escape(peer_role) + "\"";
   if (extra_status) out += "," + extra_status();
@@ -2407,6 +2417,7 @@ static const char *test_label(const std::string &n) {
   if (n == "test_update") return "проверка обновления прошивки";
   if (n == "test_resources") return "ресурсы: память и сокеты";
   if (n == "test_tiebreak") return "тай-брейк: сброс обоих";
+  if (n == "test_hx") return "датчик HX711: надёжность подсказки";
   return nullptr;
 }
 
@@ -2516,6 +2527,36 @@ static void test_task(void *arg) {
           (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     evlog('i', "[%s] работа: %lu с с запуска", clock_stamp().c_str(), (unsigned long) (now_ms() / 1000));
     set_status(used >= CONFIG_LWIP_MAX_SOCKETS - 1 ? "Сокеты почти исчерпаны" : "Ресурсы в норме");
+  } else if (self == "test_hx") {
+    // 30 секунд, раз в секунду смотрим подсказку: она должна быть стабильной и совпадать с действительностью
+    // (датчик подключён: «ok»; отключён: «nodata»). Итог пишем в чёрный ящик тегом HX.
+    if (!hxdet::capable) {
+      evlog('i', "[%s] HX711: в этой прошивке датчика нет, тест не нужен", clock_stamp().c_str());
+      bb::key("HX", "test skipped: firmware has no HX711");
+      set_status("Тест датчика: в этой прошивке HX711 нет");
+    } else {
+      int counts[5] = {0, 0, 0, 0, 0};
+      int flips = 0, prev = -1;
+      for (int i = 0; i < 30; i++) {
+        const int c = hxdet::code();
+        counts[c]++;
+        if (prev >= 0 && c != prev) {
+          flips++;
+          bb::line("HX", "t=%ds hint %s -> %s", i, hxdet::name(prev), hxdet::name(c));
+        }
+        prev = c;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+      }
+      int dom = 0;
+      for (int c = 1; c < 5; c++) if (counts[c] > counts[dom]) dom = c;
+      const int hz = hxdet::rate_dhz();
+      bb::key("HX", "test done n=30 ok=%d nodata=%d stuck=%d sat=%d flips=%d dominant=%s total=%lu hz=%d.%d %s",
+              counts[hxdet::kOk], counts[hxdet::kNoData], counts[hxdet::kStuck], counts[hxdet::kSaturated], flips,
+              hxdet::name(dom), (unsigned long) hxdet::total, hz / 10, hz % 10, flips == 0 ? "STABLE" : "UNSTABLE");
+      evlog('i', "[%s] HX711: подсказка «%s», смен %d, отсчётов всего %lu, частота %d,%d Гц", clock_stamp().c_str(),
+            hxdet::name(dom), flips, (unsigned long) hxdet::total, hz / 10, hz % 10);
+      set_status(flips == 0 ? "Датчик: подсказка стабильна, сверьте с действительностью" : "Датчик: подсказка прыгает (нестабильна)");
+    }
   } else if (self == "test_update") {
     const UpdateInfo u = read_update_info();
     evlog('i', "[%s] обновление: платформа %s (chip_id %u), запущено из %s, следующий раздел %s",

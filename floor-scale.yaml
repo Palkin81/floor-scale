@@ -29,6 +29,7 @@ script:
       - lambda: |-
           ui::peer_host = "floor-screen.local";
           ui::device_kind = "scale";
+          hxdet::capable = true;   // в этой прошивке есть HX711
           ui::device_title = "Весы";
           ui::extra_status = []() -> std::string {
             return "\"live\":" + ui::num_json(id(live_kg).state) +
@@ -186,6 +187,7 @@ sensor:
       then:
         - lambda: |-
             ui::run_pending();   // команды с веб-страницы выполняются здесь, в цикле устройства
+            hxdet::note(x);      // подсказка «датчик подключён» (12.3c)
             if (isnan(x)) return;
             id(last_raw) = x;
             const uint32_t now = millis();

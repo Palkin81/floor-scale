@@ -301,6 +301,7 @@ h2{margin:24px 8px 10px;font-size:13px;font-weight:600;letter-spacing:.06em;text
     <div class="stack">
       <select class="inp" id="m-role" disabled aria-label="Роль этого устройства"><option value="scale">Весы</option><option value="screen">Экран</option></select>
     </div>
+    <p class="hint" id="m-hx" style="margin:12px 0 0"></p>
   </div>
   <h2>Сосед (вручную)</h2>
   <div class="glass card">
@@ -400,6 +401,11 @@ h2{margin:24px 8px 10px;font-size:13px;font-weight:600;letter-spacing:.06em;text
     <h3 style="margin:0 0 6px">Экспорт настроек</h3>
     <p class="hint" style="margin:0 0 12px">Собирает файл настроек в памяти, шифрует и расшифровывает его и пишет в журнал, что в нём есть (сеть, калибровка) и размер. Пароли в журнал не пишутся.</p>
     <button class="btn" data-test="export">Проверить экспорт</button>
+  </div>
+  <div class="glass card">
+    <h3 style="margin:0 0 6px">Датчик HX711</h3>
+    <p class="hint" style="margin:0 0 12px">Тест 30 секунд: раз в секунду проверяет подсказку «датчик подключён» и пишет в чёрный ящик, не прыгает ли она. Запустите дважды: с подключённым датчиком и с отключённым; подсказка должна совпасть с действительностью. На устройстве без HX711 тест пропускается.</p>
+    <button class="btn" data-test="hx">Проверить датчик</button>
   </div>
 </section>
 </main>
@@ -574,6 +580,8 @@ function renderCurve(s){
 function render(j){
   isScale=j.kind==='scale';
   const simple=(j.mode|0)===1;
+  if(j.hx!==undefined){const hx=j.hx|0,hz=((j.hx_dhz|0)/10).toFixed(1).replace('.',',');
+    txt('m-hx',['Датчик HX711: в этой прошивке его нет. Это подсказка, роль вы выбираете сами.','Датчик HX711: данных нет, он не подключён или не отвечает. Это подсказка, роль вы выбираете сами.','Датчик HX711: отвечает ('+hz+' Гц). Это подсказка, роль вы выбираете сами.','Датчик HX711: значения не меняются, проверьте провода и питание.','Датчик HX711: значение упёрлось в предел, проверьте тензодатчик и провода.'][hx]||'')}
   {const ft=j.ft|0,m=['Тест не запущен','Идёт этап A (текущая сеть), около 1,5 минуты','Этап A готов. Подключите оба устройства к домашней сети в разделе «Сеть»: тест продолжится сам','Идёт этап B (домашняя сеть), около 1,5 минуты'];
   txt('l-mode',(j.trial|0)>0?'ждёт подтверждения':(simple?'простой':''));
   txt('ft-state',simple&&ft===0?'Недоступно в простом режиме: нужен сосед':(m[ft]||m[0]));$('ft-start').disabled=simple||ft!==0||!j.peer_link;$('ft-cancel').disabled=ft===0;}
