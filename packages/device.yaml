@@ -1,8 +1,10 @@
-# Общая часть ВЕСОВ (HX711, измерение, калибровка) для любой платы.
-# Подключается из входного файла платы вместе с packages/common.yaml. Во входном файле заданы:
-#   substitutions: board, esp_variant, hx_dout_pin, hx_clk_pin;
+# Весь код устройства (весы, экран, связь, роли) для любой платы. Роль задаётся в настройках (NVS):
+# датчик HX711 включён = «весы», выключен = «экран». Подключается из входного файла платы вместе
+# с packages/common.yaml. Во входном файле заданы:
+#   substitutions: board, esp_variant, board_label, hx_dout_pin, hx_clk_pin, hx_dout_label, hx_clk_label,
+#                  hx_default (1 = датчик включён по умолчанию), peer_hostname;
 #   esphome: name, friendly_name; раздел esp32 (board, variant).
-# Входные файлы: floor-scale.yaml (XIAO ESP32-C6), floor-scale-esp32.yaml (ESP32 DevKit).
+# Входные файлы: floor-c6.yaml (XIAO ESP32-C6), floor-esp32.yaml (ESP32 DevKit).
 
 substitutions:
   trigger_kg: "1.5"          # порог срабатывания, кг
@@ -26,99 +28,105 @@ script:
   - id: device_setup
     then:
       - lambda: |-
-          ui::peer_host = "floor-screen.local";
-          ui::device_kind = "scale";
-          hxdet::capable = true;   // в этой прошивке есть HX711
-          ui::device_title = "Весы";
-          ui::extra_status = []() -> std::string {
-            return "\"live\":" + ui::num_json(id(live_kg).state) +
-                   ",\"result\":" + ui::num_json(id(result_kg).state) +
-                   ",\"curve\":\"" + ui::json_escape(id(curve).state.c_str()) + "\"";
-          };
-          ui::on_zero = []() -> std::string {
-            id(cal_arm) = 0;
-            id(cal_buf).clear();
-            id(baseline) = id(last_raw);
-            id(zero_raw).make_call().set_value(id(baseline)).perform();
-            id(curve_dirty) = 1;
-            id(init_cnt) = ${init_n};
-            return "Ноль сохранён";
-          };
-          ui::on_calib = [](float known) -> std::string {
-            if (isnan(known) || known <= 0.05f) return "Укажите вес больше 0";
-            if (id(init_cnt) < ${init_n}) return "Подождите, снимается ноль";
-            id(known_kg).make_call().set_value(known).perform();
-            id(cal_buf).clear();
-            id(cal_arm) = 1;
-            id(cal_since) = millis();
-            id(state) = 0;
-            id(off_at) = 0;
-            id(display_active).publish_state(true);
-            char t[72];
-            snprintf(t, sizeof(t), "Положите %.1f кг и не двигайтесь", known);
-            return std::string(t);
-          };
-          ui::on_curve_reset = []() -> std::string {
-            id(cal_arm) = 0;
-            id(cal_buf).clear();
-            id(p1_kg).make_call().set_value(0).perform();
-            id(p1_counts).make_call().set_value(0).perform();
-            id(p2_kg).make_call().set_value(0).perform();
-            id(p2_counts).make_call().set_value(0).perform();
-            id(p3_kg).make_call().set_value(0).perform();
-            id(p3_counts).make_call().set_value(0).perform();
-            id(p4_kg).make_call().set_value(0).perform();
-            id(p4_counts).make_call().set_value(0).perform();
-            id(p5_kg).make_call().set_value(0).perform();
-            id(p5_counts).make_call().set_value(0).perform();
-            id(curve_dirty) = 1;
-            return "Кривая сброшена";
-          };
-          // Экспорт калибровки: "ноль,кг1,отсч1,…,кг5,отсч5"
-          ui::export_cal = []() -> std::string {
-            auto f = [](float v) { return isnan(v) ? 0.0f : v; };
-            char t[200];
-            snprintf(t, sizeof(t), "%.0f,%.1f,%.0f,%.1f,%.0f,%.1f,%.0f,%.1f,%.0f,%.1f,%.0f",
-                     f(id(zero_raw).state),
-                     f(id(p1_kg).state), f(id(p1_counts).state), f(id(p2_kg).state), f(id(p2_counts).state),
-                     f(id(p3_kg).state), f(id(p3_counts).state), f(id(p4_kg).state), f(id(p4_counts).state),
-                     f(id(p5_kg).state), f(id(p5_counts).state));
-            return std::string(t);
-          };
-          // Импорт: строго 11 чисел в допустимых пределах, иначе ничего не меняем
-          ui::import_cal = [](const std::string &text) -> std::string {
-            float v[11];
-            const char *p = text.c_str();
-            for (int i = 0; i < 11; i++) {
-              char *end = nullptr;
-              v[i] = strtof(p, &end);
-              if (end == p || !std::isfinite(v[i])) return "Калибровка в файле повреждена";
-              const bool is_kg = i > 0 && (i % 2) == 1;
-              if (is_kg ? (v[i] < 0.0f || v[i] > 300.0f) : fabsf(v[i]) > 10000000.0f)
-                return "Калибровка в файле вне допустимых пределов";
-              p = end;
-              if (i < 10) {
-                if (*p != ',') return "Калибровка в файле повреждена";
-                p++;
+          devcfg::def_hx = ${hx_default};      // стартовая периферия платы; пользователь меняет в настройках
+          const bool hx = devcfg::hx_on();     // роль выбирается при загрузке
+          ui::peer_host = "${peer_hostname}";
+          ui::device_kind = hx ? "scale" : "screen";
+          hxdet::capable = hx;
+          ui::device_title = hx ? "Весы" : "Экран";
+          ui::board_name = "${board_label}";
+          ui::wiring_json = "[{\"n\":\"HX711 DOUT\",\"p\":\"${hx_dout_label}\"},{\"n\":\"HX711 CLK\",\"p\":\"${hx_clk_label}\"}]";
+          if (hx) {  // у экрана хуков калибровки нет: он спрашивает весы у соседа
+            ui::extra_status = []() -> std::string {
+              return "\"live\":" + ui::num_json(id(live_kg).state) +
+                     ",\"result\":" + ui::num_json(id(result_kg).state) +
+                     ",\"curve\":\"" + ui::json_escape(id(curve).state.c_str()) + "\"";
+            };
+            ui::on_zero = []() -> std::string {
+              id(cal_arm) = 0;
+              id(cal_buf).clear();
+              id(baseline) = id(last_raw);
+              id(zero_raw).make_call().set_value(id(baseline)).perform();
+              id(curve_dirty) = 1;
+              id(init_cnt) = ${init_n};
+              return "Ноль сохранён";
+            };
+            ui::on_calib = [](float known) -> std::string {
+              if (isnan(known) || known <= 0.05f) return "Укажите вес больше 0";
+              if (id(init_cnt) < ${init_n}) return "Подождите, снимается ноль";
+              id(known_kg).make_call().set_value(known).perform();
+              id(cal_buf).clear();
+              id(cal_arm) = 1;
+              id(cal_since) = millis();
+              id(state) = 0;
+              id(off_at) = 0;
+              id(display_active).publish_state(true);
+              char t[72];
+              snprintf(t, sizeof(t), "Положите %.1f кг и не двигайтесь", known);
+              return std::string(t);
+            };
+            ui::on_curve_reset = []() -> std::string {
+              id(cal_arm) = 0;
+              id(cal_buf).clear();
+              id(p1_kg).make_call().set_value(0).perform();
+              id(p1_counts).make_call().set_value(0).perform();
+              id(p2_kg).make_call().set_value(0).perform();
+              id(p2_counts).make_call().set_value(0).perform();
+              id(p3_kg).make_call().set_value(0).perform();
+              id(p3_counts).make_call().set_value(0).perform();
+              id(p4_kg).make_call().set_value(0).perform();
+              id(p4_counts).make_call().set_value(0).perform();
+              id(p5_kg).make_call().set_value(0).perform();
+              id(p5_counts).make_call().set_value(0).perform();
+              id(curve_dirty) = 1;
+              return "Кривая сброшена";
+            };
+            // Экспорт калибровки: "ноль,кг1,отсч1,…,кг5,отсч5"
+            ui::export_cal = []() -> std::string {
+              auto f = [](float v) { return isnan(v) ? 0.0f : v; };
+              char t[200];
+              snprintf(t, sizeof(t), "%.0f,%.1f,%.0f,%.1f,%.0f,%.1f,%.0f,%.1f,%.0f,%.1f,%.0f",
+                       f(id(zero_raw).state),
+                       f(id(p1_kg).state), f(id(p1_counts).state), f(id(p2_kg).state), f(id(p2_counts).state),
+                       f(id(p3_kg).state), f(id(p3_counts).state), f(id(p4_kg).state), f(id(p4_counts).state),
+                       f(id(p5_kg).state), f(id(p5_counts).state));
+              return std::string(t);
+            };
+            // Импорт: строго 11 чисел в допустимых пределах, иначе ничего не меняем
+            ui::import_cal = [](const std::string &text) -> std::string {
+              float v[11];
+              const char *p = text.c_str();
+              for (int i = 0; i < 11; i++) {
+                char *end = nullptr;
+                v[i] = strtof(p, &end);
+                if (end == p || !std::isfinite(v[i])) return "Калибровка в файле повреждена";
+                const bool is_kg = i > 0 && (i % 2) == 1;
+                if (is_kg ? (v[i] < 0.0f || v[i] > 300.0f) : fabsf(v[i]) > 10000000.0f)
+                  return "Калибровка в файле вне допустимых пределов";
+                p = end;
+                if (i < 10) {
+                  if (*p != ',') return "Калибровка в файле повреждена";
+                  p++;
+                }
               }
-            }
-            id(cal_arm) = 0;
-            id(cal_buf).clear();
-            id(zero_raw).make_call().set_value(v[0]).perform();
-            id(baseline) = v[0];
-            id(p1_kg).make_call().set_value(v[1]).perform();
-            id(p1_counts).make_call().set_value(v[2]).perform();
-            id(p2_kg).make_call().set_value(v[3]).perform();
-            id(p2_counts).make_call().set_value(v[4]).perform();
-            id(p3_kg).make_call().set_value(v[5]).perform();
-            id(p3_counts).make_call().set_value(v[6]).perform();
-            id(p4_kg).make_call().set_value(v[7]).perform();
-            id(p4_counts).make_call().set_value(v[8]).perform();
-            id(p5_kg).make_call().set_value(v[9]).perform();
-            id(p5_counts).make_call().set_value(v[10]).perform();
-            id(curve_dirty) = 1;
-            return "Калибровка импортирована";
-          };
+              id(cal_arm) = 0;
+              id(cal_buf).clear();
+              id(zero_raw).make_call().set_value(v[0]).perform();
+              id(baseline) = v[0];
+              id(p1_kg).make_call().set_value(v[1]).perform();
+              id(p1_counts).make_call().set_value(v[2]).perform();
+              id(p2_kg).make_call().set_value(v[3]).perform();
+              id(p2_counts).make_call().set_value(v[4]).perform();
+              id(p3_kg).make_call().set_value(v[5]).perform();
+              id(p3_counts).make_call().set_value(v[6]).perform();
+              id(p4_kg).make_call().set_value(v[7]).perform();
+              id(p4_counts).make_call().set_value(v[8]).perform();
+              id(p5_kg).make_call().set_value(v[9]).perform();
+              id(p5_counts).make_call().set_value(v[10]).perform();
+              id(curve_dirty) = 1;
+              return "Калибровка импортирована";
+            };
+          }
 
 logger:
   logs:
@@ -162,14 +170,24 @@ globals:
   - id: cal_buf
     type: std::vector<float>
 
+interval:
+  - interval: ${hx_interval}   # 10 Гц, как раньше; без датчика компонент блокировал бы цикл до 150 мс
+    then:
+      - lambda: |-
+          if (hxdet::capable) id(hx711_sensor)->update();
+
 sensor:
+  - platform: wifi_signal
+    name: signal
+    update_interval: 30s
   - platform: hx711
+    id: hx711_sensor
     name: hx711_raw
     internal: true
     dout_pin: ${hx_dout_pin}
     clk_pin: ${hx_clk_pin}
     gain: 128
-    update_interval: ${hx_interval}
+    update_interval: never   # опрашиваем сами, только если датчик включён в настройках (см. interval ниже)
     filters:
       - median:
           window_size: ${med_n}

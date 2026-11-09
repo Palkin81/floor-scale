@@ -4,7 +4,7 @@
 //    (and at once if the device reboots during the trial);
 //  * 3 consecutive short power-on boots reset all settings and the saved Wi-Fi network (the user can always
 //    get back to a known state without a computer).
-// Fields: mode (0 = with remote screen, 1 = simple), manual neighbour record (ip, mac, role).
+// Fields: mode (0 = with remote screen, 1 = simple), hx (weight sensor on/off/default), manual neighbour record.
 
 #include <string.h>
 #include <string>
@@ -20,6 +20,7 @@ inline constexpr uint8_t kQuickBootsToReset = 3;
 
 struct Values {
   uint8_t mode = 0;            // 0 = with remote screen, 1 = simple
+  uint8_t hx = 2;              // weight sensor HX711: 0 = off (screen), 1 = on (scale), 2 = board default
   char peer_ip[16] = "";       // manual neighbour address (empty = automatic)
   char peer_mac[18] = "";      // informational
   char peer_role[8] = "";      // "", "scale", "screen"
@@ -36,6 +37,12 @@ inline uint32_t ms() { return (uint32_t) (esp_timer_get_time() / 1000); }
 
 // Simple mode (mode 1): the device works alone. No neighbour search, no role election, no polling.
 inline bool simple() { return cur.mode == 1; }
+
+// HX711 weight sensor: the board default comes from the YAML (set at boot), the user can override it.
+// Role "scale" = sensor on, role "screen" = sensor off; it takes effect after a reboot.
+inline uint8_t def_hx = 0;
+inline bool hx_eff(const Values &v) { return v.hx == 2 ? def_hx != 0 : v.hx == 1; }
+inline bool hx_on() { return hx_eff(cur); }
 
 inline void save_all() {
   if (!ready) return;
