@@ -297,13 +297,16 @@ h2{margin:24px 8px 10px;font-size:13px;font-weight:600;letter-spacing:.06em;text
   </div>
   <h2>Роль этого устройства</h2>
   <div class="glass card">
-    <p class="hint" style="margin:0 0 12px">Роль задаёт файл сборки платы: весы (floor-scale*.yaml) или экран (screen_stub*.yaml). Логика одна и та же на ESP32-C6 и ESP32; чтобы поменять роль, прошейте устройство другим файлом.</p>
+    <p class="hint" style="margin:0 0 12px">Весь код есть в любой прошивке. «Весы»: датчик HX711 включён, устройство измеряет вес. «Экран»: датчик выключен, вес берётся у соседних весов. Роль вступает в силу после подтверждения и перезагрузки.</p>
     <div class="stack">
-      <select class="inp" id="m-role" disabled aria-label="Роль этого устройства"><option value="scale">Весы</option><option value="screen">Экран</option></select>
+      <select class="inp" id="m-role" aria-label="Роль этого устройства"><option value="scale">Весы (датчик HX711 включён)</option><option value="screen">Экран (датчик выключен)</option></select>
     </div>
     <p class="hint" id="m-board" style="margin:12px 0 0"></p>
     <p class="hint" id="m-hx" style="margin:6px 0 0"></p>
   </div>
+  <h2>Схема подключения</h2>
+  <div class="glass list" id="m-wiring"></div>
+  <p class="hint" style="margin:-6px 8px 14px">Только просмотр: номера выводов задаёт файл платы (floor-c6.yaml, floor-esp32.yaml).</p>
   <h2>Сосед (вручную)</h2>
   <div class="glass card">
     <p class="hint" style="margin:0 0 12px">Если автоматический поиск соседа в домашней сети не срабатывает, задайте его адрес. Пустое поле: поиск автоматический. Порядок поиска: заданный адрес, затем запомненный, затем поиск по сети.</p>
@@ -405,7 +408,7 @@ h2{margin:24px 8px 10px;font-size:13px;font-weight:600;letter-spacing:.06em;text
   </div>
   <div class="glass card">
     <h3 style="margin:0 0 6px">Датчик HX711</h3>
-    <p class="hint" style="margin:0 0 12px">Тест 30 секунд: раз в секунду проверяет подсказку «датчик подключён» и пишет в чёрный ящик, не прыгает ли она. Запустите дважды: с подключённым датчиком и с отключённым; подсказка должна совпасть с действительностью. На устройстве без HX711 тест пропускается.</p>
+    <p class="hint" style="margin:0 0 12px">Тест 30 секунд: раз в секунду проверяет подсказку «датчик подключён» и пишет в чёрный ящик, не прыгает ли она. Запустите дважды: с подключённым датчиком и с отключённым; подсказка должна совпасть с действительностью. При роли «экран» (датчик выключен) тест пропускается.</p>
     <button class="btn" data-test="hx">Проверить датчик</button>
   </div>
 </section>
@@ -583,7 +586,7 @@ function render(j){
   const simple=(j.mode|0)===1;
   if(j.chip)txt('m-board','Плата: '+j.chip+'. Прошивка собрана как '+(isScale?'весы':'экран')+'.');
   if(j.hx!==undefined){const hx=j.hx|0,hz=((j.hx_dhz|0)/10).toFixed(1).replace('.',',');
-    txt('m-hx',['Датчик HX711: в этой прошивке его нет. Это подсказка, роль вы выбираете сами.','Датчик HX711: данных нет, он не подключён или не отвечает. Это подсказка, роль вы выбираете сами.','Датчик HX711: отвечает ('+hz+' Гц). Это подсказка, роль вы выбираете сами.','Датчик HX711: значения не меняются, проверьте провода и питание.','Датчик HX711: значение упёрлось в предел, проверьте тензодатчик и провода.'][hx]||'')}
+    txt('m-hx',['Датчик HX711 выключен: роль «экран». Чтобы включить его, выберите роль «Весы» выше. Это подсказка, роль вы выбираете сами.','Датчик HX711: данных нет, он не подключён или не отвечает. Это подсказка, роль вы выбираете сами.','Датчик HX711: отвечает ('+hz+' Гц). Это подсказка, роль вы выбираете сами.','Датчик HX711: значения не меняются, проверьте провода и питание.','Датчик HX711: значение упёрлось в предел, проверьте тензодатчик и провода.'][hx]||'')}
   {const ft=j.ft|0,m=['Тест не запущен','Идёт этап A (текущая сеть), около 1,5 минуты','Этап A готов. Подключите оба устройства к домашней сети в разделе «Сеть»: тест продолжится сам','Идёт этап B (домашняя сеть), около 1,5 минуты'];
   txt('l-mode',(j.trial|0)>0?'ждёт подтверждения':(simple?'простой':''));
   txt('ft-state',simple&&ft===0?'Недоступно в простом режиме: нужен сосед':(m[ft]||m[0]));$('ft-start').disabled=simple||ft!==0||!j.peer_link;$('ft-cancel').disabled=ft===0;}
@@ -813,7 +816,12 @@ let uploading=false,fwInfo=null,fwFile=null;
 let mCfg=null,mTimer=0;
 function mRender(c){
   mCfg=c;
-  $('m-mode').value=String(c.mode);$('m-role').value=c.kind;
+  $('m-mode').value=String(c.mode);$('m-role').value=c.hx?'scale':'screen';
+  const w=$('m-wiring');clear(w);
+  const row=(k,v)=>{const r=el('div','row');r.append(el('span','k',k),el('span','v',v));w.append(r)};
+  row('Плата',c.board||'—');
+  (c.pins||[]).forEach(p=>row(p.n,p.p));
+  if(!(c.pins||[]).length)row('Выводы','нет данных');
   if(document.activeElement!==$('m-ip'))$('m-ip').value=c.peer_ip||'';
   if(document.activeElement!==$('m-mac'))$('m-mac').value=c.peer_mac||'';
   $('m-prole').value=c.peer_role||'';
@@ -829,7 +837,7 @@ async function loadMode(){
 }
 $('m-save').onclick=async()=>{
   try{
-    const j=await post('/devcfg',{mode:$('m-mode').value,peer_ip:$('m-ip').value.trim(),peer_mac:$('m-mac').value.trim(),peer_role:$('m-prole').value});
+    const j=await post('/devcfg',{mode:$('m-mode').value,hx:$('m-role').value==='scale'?'1':'0',peer_ip:$('m-ip').value.trim(),peer_mac:$('m-mac').value.trim(),peer_role:$('m-prole').value});
     say(j.msg,!j.ok);loadMode();
   }catch(e){say('Нет связи с устройством')}
 };

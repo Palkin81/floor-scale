@@ -1,0 +1,25 @@
+# ESP32 DevKit: по умолчанию экран (HX711 при включении: DOUT GPIO33, SCK GPIO32).
+# Весь код общий (packages/common.yaml и packages/device.yaml): весы, экран, связь, роли.
+# Здесь только плата и номера GPIO; роль (датчик HX711 вкл/выкл) выбирается в настройках устройства.
+substitutions:
+  board: esp32dev
+  esp_variant: esp32
+  board_label: "ESP32 DevKit"
+  hx_dout_pin: GPIO33
+  hx_clk_pin: GPIO32
+  hx_dout_label: "GPIO33"
+  hx_clk_label: "GPIO32"
+  hx_default: "0"          # датчик HX711 включён по умолчанию (1 = весы, 0 = экран)
+  peer_hostname: floor-scale.local
+
+packages:
+  common: !include packages/common.yaml
+  device: !include packages/device.yaml
+
+esphome:
+  name: floor-screen
+  friendly_name: device
+
+esp32:
+  board: ${board}
+  variant: ${esp_variant}

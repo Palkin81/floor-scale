@@ -36,10 +36,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {config: floor-scale.yaml, board: seeed_xiao_esp32c6}
-          - {config: floor-scale-esp32.yaml, board: esp32dev}
-          - {config: screen_stub.yaml, board: esp32dev}
-          - {config: screen_stub_c6.yaml, board: seeed_xiao_esp32c6}
+          - {config: floor-c6.yaml, board: seeed_xiao_esp32c6}
+          - {config: floor-esp32.yaml, board: esp32dev}
     steps:
       - uses: actions/checkout@v4
 
@@ -125,7 +123,7 @@ jobs:
             } > $d/secrets.yaml
           done
           esc() { sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}'; }
-          for f in floor-scale floor-scale-esp32 screen_stub screen_stub_c6; do
+          for f in floor-c6 floor-esp32; do
             [ -f old/$f.yaml ] || { echo "::notice title=$f.yaml::нового файла в main ещё нет, сравнивать не с чем"; continue; }
             (cd old && esphome config $f.yaml > ../$f.old.txt 2>&1)
             (cd new && esphome config $f.yaml > ../$f.new.txt 2>&1)

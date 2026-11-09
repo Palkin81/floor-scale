@@ -53,7 +53,7 @@ inline std::string setup_ssid;
 inline constexpr int kProto = 1;
 // Code version: bumped by hand with every change, so the page and the black box show which code is on the device.
 // (ESPHome build time is NOT the compile time: with reproducible builds it only changes with the config.)
-inline constexpr const char *kFwVersion = "12.3.0";
+inline constexpr const char *kFwVersion = "12.4.0";
 inline int peer_proto = -1;                 // версия протокола соседа по последнему ответу, -1 = нет данных
 inline std::string peer_host;
 inline std::function<void(const std::string &, const std::string &)> on_creds;
@@ -102,6 +102,8 @@ inline int peer_misses = 0;                // подряд пропущенны�
 
 // ---- устройство ----
 inline std::string device_kind = "screen";        // "screen" или "scale"
+inline std::string board_name;                    // название платы (из YAML), для схемы подключения
+inline std::string wiring_json = "[]";             // [{"n":"HX711 DOUT","p":"GPIO18 (D10)"},...], из YAML
 inline std::string device_title = "Экран";        // заголовок страницы
 // Фрагмент JSON без ведущей запятой, например "\"live\":1.2". Задаётся из YAML.
 inline std::function<std::string()> extra_status;
@@ -483,13 +485,16 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 </div>
 <h2>Роль этого устройства</h2>
 <div class="glass card">
-<p class="hint" style="margin:0 0 12px">Роль задаёт файл сборки платы: весы (floor-scale*.yaml) или экран (screen_stub*.yaml). Логика одна и та же на ESP32-C6 и ESP32; чтобы поменять роль, прошейте устройство другим файлом.</p>
+<p class="hint" style="margin:0 0 12px">Весь код есть в любой прошивке. «Весы»: датчик HX711 включён, устройство измеряет вес. «Экран»: датчик выключен, вес берётся у соседних весов. Роль вступает в силу после подтверждения и перезагрузки.</p>
 <div class="stack">
-<select class="inp" id="m-role" disabled aria-label="Роль этого устройства"><option value="scale">Весы</option><option value="screen">Экран</option></select>
+<select class="inp" id="m-role" aria-label="Роль этого устройства"><option value="scale">Весы (датчик HX711 включён)</option><option value="screen">Экран (датчик выключен)</option></select>
 </div>
 <p class="hint" id="m-board" style="margin:12px 0 0"></p>
 <p class="hint" id="m-hx" style="margin:6px 0 0"></p>
 </div>
+<h2>Схема подключения</h2>
+<div class="glass list" id="m-wiring"></div>
+<p class="hint" style="margin:-6px 8px 14px">Только просмотр: номера выводов задаёт файл платы (floor-c6.yaml, floor-esp32.yaml).</p>
 <h2>Сосед (вручную)</h2>
 <div class="glass card">
 <p class="hint" style="margin:0 0 12px">Если автоматический поиск соседа в домашней сети не срабатывает, задайте его адрес. Пустое поле: поиск автоматический. Порядок поиска: заданный адрес, затем запомненный, затем поиск по сети.</p>
@@ -589,7 +594,7 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 </div>
 <div class="glass card">
 <h3 style="margin:0 0 6px">Датчик HX711</h3>
-<p class="hint" style="margin:0 0 12px">Тест 30 секунд: раз в секунду проверяет подсказку «датчик подключён» и пишет в чёрный ящик, не прыгает ли она. Запустите дважды: с подключённым датчиком и с отключённым; подсказка должна совпасть с действительностью. На устройстве без HX711 тест пропускается.</p>
+<p class="hint" style="margin:0 0 12px">Тест 30 секунд: раз в секунду проверяет подсказку «датчик подключён» и пишет в чёрный ящик, не прыгает ли она. Запустите дважды: с подключённым датчиком и с отключённым; подсказка должна совпасть с действительностью. При роли «экран» (датчик выключен) тест пропускается.</p>
 <button class="btn" data-test="hx">Проверить датчик</button>
 </div>
 </section>
@@ -759,7 +764,7 @@ isScale=j.kind==='scale';
 const simple=(j.mode|0)===1;
 if(j.chip)txt('m-board','Плата: '+j.chip+'. Прошивка собрана как '+(isScale?'весы':'экран')+'.');
 if(j.hx!==undefined){const hx=j.hx|0,hz=((j.hx_dhz|0)/10).toFixed(1).replace('.',',');
-txt('m-hx',['Датчик HX711: в этой прошивке его нет. Это подсказка, роль вы выбираете сами.','Датчик HX711: данных нет, он не подключён или не отвечает. Это подсказка, роль вы выбираете сами.','Датчик HX711: отвечает ('+hz+' Гц). Это подсказка, роль вы выбираете сами.','Датчик HX711: значения не меняются, проверьте провода и питание.','Датчик HX711: значение упёрлось в предел, проверьте тензодатчик и провода.'][hx]||'')}
+txt('m-hx',['Датчик HX711 выключен: роль «экран». Чтобы включить его, выберите роль «Весы» выше. Это подсказка, роль вы выбираете сами.','Датчик HX711: данных нет, он не подключён или не отвечает. Это подсказка, роль вы выбираете сами.','Датчик HX711: отвечает ('+hz+' Гц). Это подсказка, роль вы выбираете сами.','Датчик HX711: значения не меняются, проверьте провода и питание.','Датчик HX711: значение упёрлось в предел, проверьте тензодатчик и провода.'][hx]||'')}
 {const ft=j.ft|0,m=['Тест не запущен','Идёт этап A (текущая сеть), около 1,5 минуты','Этап A готов. Подключите оба устройства к домашней сети в разделе «Сеть»: тест продолжится сам','Идёт этап B (домашняя сеть), около 1,5 минуты'];
 txt('l-mode',(j.trial|0)>0?'ждёт подтверждения':(simple?'простой':''));
 txt('ft-state',simple&&ft===0?'Недоступно в простом режиме: нужен сосед':(m[ft]||m[0]));$('ft-start').disabled=simple||ft!==0||!j.peer_link;$('ft-cancel').disabled=ft===0;}
@@ -983,7 +988,12 @@ let uploading=false,fwInfo=null,fwFile=null;
 let mCfg=null,mTimer=0;
 function mRender(c){
 mCfg=c;
-$('m-mode').value=String(c.mode);$('m-role').value=c.kind;
+$('m-mode').value=String(c.mode);$('m-role').value=c.hx?'scale':'screen';
+const w=$('m-wiring');clear(w);
+const row=(k,v)=>{const r=el('div','row');r.append(el('span','k',k),el('span','v',v));w.append(r)};
+row('Плата',c.board||'—');
+(c.pins||[]).forEach(p=>row(p.n,p.p));
+if(!(c.pins||[]).length)row('Выводы','нет данных');
 if(document.activeElement!==$('m-ip'))$('m-ip').value=c.peer_ip||'';
 if(document.activeElement!==$('m-mac'))$('m-mac').value=c.peer_mac||'';
 $('m-prole').value=c.peer_role||'';
@@ -999,7 +1009,7 @@ try{mRender(await api('/devcfg'))}catch(e){say('Нет связи с устро�
 }
 $('m-save').onclick=async()=>{
 try{
-const j=await post('/devcfg',{mode:$('m-mode').value,peer_ip:$('m-ip').value.trim(),peer_mac:$('m-mac').value.trim(),peer_role:$('m-prole').value});
+const j=await post('/devcfg',{mode:$('m-mode').value,hx:$('m-role').value==='scale'?'1':'0',peer_ip:$('m-ip').value.trim(),peer_mac:$('m-mac').value.trim(),peer_role:$('m-prole').value});
 say(j.msg,!j.ok);loadMode();
 }catch(e){say('Нет связи с устройством')}
 };
@@ -2536,9 +2546,9 @@ static void test_task(void *arg) {
     // 30 секунд, раз в секунду смотрим подсказку: она должна быть стабильной и совпадать с действительностью
     // (датчик подключён: «ok»; отключён: «nodata»). Итог пишем в чёрный ящик тегом HX.
     if (!hxdet::capable) {
-      evlog('i', "[%s] HX711: в этой прошивке датчика нет, тест не нужен", clock_stamp().c_str());
-      bb::key("HX", "test skipped: firmware has no HX711");
-      set_status("Тест датчика: в этой прошивке HX711 нет");
+      evlog('i', "[%s] HX711: датчик выключен в настройках (роль экран), тест не нужен", clock_stamp().c_str());
+      bb::key("HX", "test skipped: HX711 is off in settings");
+      set_status("Тест датчика: HX711 выключен в настройках");
     } else {
       int counts[5] = {0, 0, 0, 0, 0};
       int flips = 0, prev = -1;
@@ -2910,7 +2920,8 @@ inline std::string devcfg_json() {
   const devcfg::Values &v = devcfg::cur;
   return std::string("{\"ok\":true,\"mode\":") + std::to_string((int) v.mode) + ",\"kind\":\"" + device_kind +
          "\",\"peer_ip\":\"" + json_escape(v.peer_ip) + "\",\"peer_mac\":\"" + json_escape(v.peer_mac) +
-         "\",\"peer_role\":\"" + json_escape(v.peer_role) + "\",\"trial\":" +
+         "\",\"peer_role\":\"" + json_escape(v.peer_role) + "\",\"hx\":" + (devcfg::hx_eff(v) ? "1" : "0") +
+         ",\"board\":\"" + json_escape(board_name.c_str()) + "\",\"pins\":" + wiring_json + ",\"trial\":" +
          std::to_string((unsigned) devcfg::trial_left_s()) + ",\"trial_total\":" + std::to_string((unsigned) devcfg::kTrialS) +
          ",\"fw\":\"" + kFwVersion + "\"}";
 }
@@ -2930,6 +2941,11 @@ static esp_err_t h_devcfg_set(httpd_req_t *req) {
     if (mode != "0" && mode != "1") return reply_err(req, "Неверный режим");
     nv.mode = (uint8_t) (mode == "1" ? 1 : 0);
   }
+  const std::string hx = form_value(b, "hx");
+  if (!hx.empty()) {
+    if (hx != "0" && hx != "1") return reply_err(req, "Неверное значение датчика");
+    nv.hx = (uint8_t) (hx == "1" ? 1 : 0);
+  }
   if (b.find("peer_ip=") != std::string::npos) {
     const std::string ip = form_value(b, "peer_ip");
     if (!ip.empty() && !valid_ipv4(ip)) return reply_err(req, "Неверный IP соседа (нужен вид 192.168.1.20)");
@@ -2939,16 +2955,18 @@ static esp_err_t h_devcfg_set(httpd_req_t *req) {
     snprintf(nv.peer_mac, sizeof(nv.peer_mac), "%s", mac.c_str());
     const std::string role = form_value(b, "peer_role");
     if (!role.empty() && role != "scale" && role != "screen") return reply_err(req, "Неверная роль соседа");
-    if (role == device_kind) return reply_err(req, "Роль соседа должна отличаться от роли этого устройства");
+    if (!role.empty() && role == (devcfg::hx_eff(nv) ? "scale" : "screen"))
+      return reply_err(req, "Роль соседа должна отличаться от роли этого устройства");
     snprintf(nv.peer_role, sizeof(nv.peer_role), "%s", role.c_str());
   }
-  if (nv.mode == devcfg::cur.mode && strcmp(nv.peer_ip, devcfg::cur.peer_ip) == 0 &&
+  if (nv.mode == devcfg::cur.mode && devcfg::hx_eff(nv) == devcfg::hx_on() && strcmp(nv.peer_ip, devcfg::cur.peer_ip) == 0 &&
       strcmp(nv.peer_mac, devcfg::cur.peer_mac) == 0 && strcmp(nv.peer_role, devcfg::cur.peer_role) == 0) {
     return reply_msg(req, "Без изменений");
   }
   devcfg::apply_trial(nv);
   home_peer_ip.clear();  // search again with the new record
-  bb::key("CFG", "applied on trial mode=%d peer_ip=%s peer_role=%s (rollback in %us)", (int) nv.mode,
+  bb::key("CFG", "applied on trial mode=%d hx=%d peer_ip=%s peer_role=%s (rollback in %us)", (int) nv.mode,
+          devcfg::hx_eff(nv) ? 1 : 0,
           nv.peer_ip[0] ? nv.peer_ip : "-", nv.peer_role[0] ? nv.peer_role : "-", (unsigned) devcfg::kTrialS);
   set_status("Настройки применены пробно: подтвердите в течение 3 минут");
   return reply_msg(req, "Применено пробно. Подтвердите в течение 3 минут, иначе вернутся прежние");
@@ -2956,7 +2974,8 @@ static esp_err_t h_devcfg_set(httpd_req_t *req) {
 
 static esp_err_t h_devcfg_confirm(httpd_req_t *req) {
   // Роль выбирается при загрузке, поэтому смена режима вступает в силу после перезагрузки.
-  const bool mode_changed = devcfg::trial && devcfg::prev.mode != devcfg::cur.mode;
+  const bool mode_changed = devcfg::trial && (devcfg::prev.mode != devcfg::cur.mode ||
+                                              devcfg::hx_eff(devcfg::prev) != devcfg::hx_eff(devcfg::cur));
   devcfg::confirm();
   bb::key("CFG", "confirmed mode=%d%s", (int) devcfg::cur.mode, mode_changed ? " (mode changed, rebooting)" : "");
   if (mode_changed && on_reboot) {

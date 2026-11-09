@@ -1,0 +1,25 @@
+# XIAO ESP32-C6: по умолчанию весы (HX711 на D10 и D9).
+# Весь код общий (packages/common.yaml и packages/device.yaml): весы, экран, связь, роли.
+# Здесь только плата и номера GPIO; роль (датчик HX711 вкл/выкл) выбирается в настройках устройства.
+substitutions:
+  board: seeed_xiao_esp32c6
+  esp_variant: esp32c6
+  board_label: "Seeed XIAO ESP32-C6"
+  hx_dout_pin: GPIO18
+  hx_clk_pin: GPIO20
+  hx_dout_label: "GPIO18 (D10)"
+  hx_clk_label: "GPIO20 (D9)"
+  hx_default: "1"          # датчик HX711 включён по умолчанию (1 = весы, 0 = экран)
+  peer_hostname: floor-screen.local
+
+packages:
+  common: !include packages/common.yaml
+  device: !include packages/device.yaml
+
+esphome:
+  name: floor-scale
+  friendly_name: device
+
+esp32:
+  board: ${board}
+  variant: ${esp_variant}
