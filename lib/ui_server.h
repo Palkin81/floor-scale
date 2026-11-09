@@ -53,7 +53,7 @@ inline std::string setup_ssid;
 inline constexpr int kProto = 1;
 // Code version: bumped by hand with every change, so the page and the black box show which code is on the device.
 // (ESPHome build time is NOT the compile time: with reproducible builds it only changes with the config.)
-inline constexpr const char *kFwVersion = "12.1.1";
+inline constexpr const char *kFwVersion = "12.3.0";
 inline int peer_proto = -1;                 // версия протокола соседа по последнему ответу, -1 = нет данных
 inline std::string peer_host;
 inline std::function<void(const std::string &, const std::string &)> on_creds;
@@ -476,17 +476,19 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <p class="hint" id="m-trial" style="margin:0 0 14px;font-weight:600" hidden></p>
 <h2 style="margin-top:6px">Режим</h2>
 <div class="glass card">
-<p class="hint" style="margin:0 0 12px">«С удалённым экраном»: весы и экран работают парой. «Простой»: устройство работает само, без соседа (режим подключается в следующем обновлении, сейчас значение только сохраняется).</p>
+<p class="hint" style="margin:0 0 12px">«С удалённым экраном»: весы и экран работают парой. «Простой»: устройство работает само: соседа не ищет, роли и сеть с ним не согласует, опрос и полный тест отключены. Когда вы подтвердите смену режима, устройство перезагрузится.</p>
 <div class="stack">
 <select class="inp" id="m-mode" aria-label="Режим работы"><option value="0">С удалённым экраном</option><option value="1">Простой</option></select>
 </div>
 </div>
 <h2>Роль этого устройства</h2>
 <div class="glass card">
-<p class="hint" style="margin:0 0 12px">Роль определяется прошивкой. Переключение роли станет доступно после объединения прошивок (этап унификации).</p>
+<p class="hint" style="margin:0 0 12px">Роль задаёт файл сборки платы: весы (floor-scale*.yaml) или экран (screen_stub*.yaml). Логика одна и та же на ESP32-C6 и ESP32; чтобы поменять роль, прошейте устройство другим файлом.</p>
 <div class="stack">
 <select class="inp" id="m-role" disabled aria-label="Роль этого устройства"><option value="scale">Весы</option><option value="screen">Экран</option></select>
 </div>
+<p class="hint" id="m-board" style="margin:12px 0 0"></p>
+<p class="hint" id="m-hx" style="margin:6px 0 0"></p>
 </div>
 <h2>Сосед (вручную)</h2>
 <div class="glass card">
@@ -584,6 +586,11 @@ background:var(--glass2);font-weight:500;line-height:1.35;transform:translate(-5
 <h3 style="margin:0 0 6px">Экспорт настроек</h3>
 <p class="hint" style="margin:0 0 12px">Собирает файл настроек в памяти, шифрует и расшифровывает его и пишет в журнал, что в нём есть (сеть, калибровка) и размер. Пароли в журнал не пишутся.</p>
 <button class="btn" data-test="export">Проверить экспорт</button>
+</div>
+<div class="glass card">
+<h3 style="margin:0 0 6px">Датчик HX711</h3>
+<p class="hint" style="margin:0 0 12px">Тест 30 секунд: раз в секунду проверяет подсказку «датчик подключён» и пишет в чёрный ящик, не прыгает ли она. Запустите дважды: с подключённым датчиком и с отключённым; подсказка должна совпасть с действительностью. На устройстве без HX711 тест пропускается.</p>
+<button class="btn" data-test="hx">Проверить датчик</button>
 </div>
 </section>
 </main>
@@ -749,9 +756,13 @@ s.split(' | ').forEach((p,i)=>box.append(el('span','pill',i===0?p.replace('но�
 }
 function render(j){
 isScale=j.kind==='scale';
+const simple=(j.mode|0)===1;
+if(j.chip)txt('m-board','Плата: '+j.chip+'. Прошивка собрана как '+(isScale?'весы':'экран')+'.');
+if(j.hx!==undefined){const hx=j.hx|0,hz=((j.hx_dhz|0)/10).toFixed(1).replace('.',',');
+txt('m-hx',['Датчик HX711: в этой прошивке его нет. Это подсказка, роль вы выбираете сами.','Датчик HX711: данных нет, он не подключён или не отвечает. Это подсказка, роль вы выбираете сами.','Датчик HX711: отвечает ('+hz+' Гц). Это подсказка, роль вы выбираете сами.','Датчик HX711: значения не меняются, проверьте провода и питание.','Датчик HX711: значение упёрлось в предел, проверьте тензодатчик и провода.'][hx]||'')}
 {const ft=j.ft|0,m=['Тест не запущен','Идёт этап A (текущая сеть), около 1,5 минуты','Этап A готов. Подключите оба устройства к домашней сети в разделе «Сеть»: тест продолжится сам','Идёт этап B (домашняя сеть), около 1,5 минуты'];
-txt('l-mode',(j.trial|0)>0?'ждёт подтверждения':'');
-txt('ft-state',m[ft]||m[0]);$('ft-start').disabled=ft!==0||!j.peer_link;$('ft-cancel').disabled=ft===0;}
+txt('l-mode',(j.trial|0)>0?'ждёт подтверждения':(simple?'простой':''));
+txt('ft-state',simple&&ft===0?'Недоступно в простом режиме: нужен сосед':(m[ft]||m[0]));$('ft-start').disabled=simple||ft!==0||!j.peer_link;$('ft-cancel').disabled=ft===0;}
 W=isScale?j:(j.scale||null);
 if(!ready){ready=true;go(location.hash.slice(1))}
 const title=j.title||'Floor Scale';txt('title',title);if(document.title!==title)document.title=title;
@@ -763,17 +774,18 @@ if(!j.peer_checked){c='wait';t='Проверка связи';peer='Провер�
 else if(j.peer_link){c='ok';t='Связь есть';peer='Подключено — '+(j.peer_role||'сосед');main='на связи'}
 else{c='bad';t='Нет связи';peer='Нет связи';main='не найдены'}
 }
+if(simple){c='';t='Простой режим';peer='Не используется';main='не нужна'}
 chip(c,t);
 // главная: вес (свой или от весов через экран) и кратко связь с калибровкой
 vis('hero-w',!!W);vis('hero-off',!W);
 if(W){txt('live',num(W.live));txt('c-live',num(W.live));txt('res',W.result==null?'нет данных':num(W.result)+' кг')}
 else{
 txt('c-live','—');
-txt('ho-main',j.peer_applicable&&j.peer_checked&&j.peer_link?'Ждём данные весов…':'Весы не на связи');
-txt('ho-sub',j.peer_applicable&&j.peer_checked&&j.peer_link?'Весы нашлись, данные ещё не пришли.':'Вес и калибровка появятся, когда экран найдёт весы.');
+txt('ho-main',simple?'Режим «Простой»':(j.peer_applicable&&j.peer_checked&&j.peer_link?'Ждём данные весов…':'Весы не на связи'));
+txt('ho-sub',simple?'Это устройство работает само и весов не ищет. Чтобы показывать вес с весов, выберите режим «С удалённым экраном» в разделе «Система → Режим и роль».':(j.peer_applicable&&j.peer_checked&&j.peer_link?'Весы нашлись, данные ещё не пришли.':'Вес и калибровка появятся, когда экран найдёт весы.'));
 }
 txt('h-peer-lab','Связь: '+peerName.toLowerCase());
-txt('h-peer',j.peer_applicable?(j.peer_checked?(j.peer_link?'Есть':'Нет'):'Проверка…'):'—');
+txt('h-peer',simple?'Не нужна':(j.peer_applicable?(j.peer_checked?(j.peer_link?'Есть':'Нет'):'Проверка…'):'—'));
 const cs=W&&W.curve;
 const npts=cs&&cs.indexOf('нет точек')!==0?cs.split(' | ').length-1:0;
 txt('h-cal',!W?'—':npts?npts+' '+(npts===1?'точка':npts<5?'точки':'точек'):'линейно');
@@ -991,7 +1003,7 @@ const j=await post('/devcfg',{mode:$('m-mode').value,peer_ip:$('m-ip').value.tri
 say(j.msg,!j.ok);loadMode();
 }catch(e){say('Нет связи с устройством')}
 };
-$('m-confirm').onclick=async()=>{try{const j=await post('/devcfg_confirm');say(j.msg);loadMode()}catch(e){say('Нет связи с устройством')}};
+$('m-confirm').onclick=async()=>{try{const j=await post('/devcfg_confirm');say(j.msg);if(j.reboot)return;loadMode()}catch(e){say('Нет связи с устройством')}};
 $('m-revert').onclick=async()=>{try{const j=await post('/devcfg_revert');say(j.msg);loadMode()}catch(e){say('Нет связи с устройством')}};
 async function loadFw(){
 try{
@@ -1440,9 +1452,10 @@ inline void peer_monitor_task(void *) {
   while (true) {
     std::string role;
     const std::string own_role = local_role();
-    const bool applicable = own_role == "Клиент (слейв)" ||
+    // Простой режим: соседа не ищем и не ждём, поэтому «нет связи» не считается сбоем.
+    const bool applicable = !devcfg::simple() && (own_role == "Клиент (слейв)" ||
                             own_role == "Точка доступа (мастер)" ||
-                            own_role == "Домашняя сеть";
+                            own_role == "Домашняя сеть");
     announce_service();
     const bool linked = applicable && probe_peer(role);
     {
@@ -1509,6 +1522,10 @@ inline void peer_data_task(void *) {
   const std::string kind_field = "\"kind\":\"" + expected + "\"";
   uint32_t streak = 0, streak_start_s = 0, last_ok_s = 0;
   while (true) {
+    if (devcfg::simple()) {  // простой режим: данные соседа не нужны
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      continue;
+    }
     std::string ip;
     const uint32_t up_s = (uint32_t) (esp_timer_get_time() / 1000000);
     bool ok = false;
@@ -1561,6 +1578,8 @@ inline std::string identity_json() {
 }
 
 // Состояние сети и отдельная проверка доступности именно второго устройства.
+inline const char *chip_name();  // определена ниже, рядом с обновлением прошивки
+
 inline std::string status_json() {
   std::string network = "нет", signal = "нет", ip = "нет", connected_ssid;
   wifi_ap_record_t ap = {};
@@ -1608,6 +1627,9 @@ inline std::string status_json() {
   out += std::string(",\"peer_link\":") + (linked ? "true" : "false");
   out += ",\"ft\":" + std::to_string((int) ft_phase);
   out += ",\"mode\":" + std::to_string((int) devcfg::cur.mode);
+  out += std::string(",\"chip\":\"") + json_escape(chip_name()) + "\"";
+  out += ",\"hx\":" + std::to_string(hxdet::code());
+  out += ",\"hx_dhz\":" + std::to_string(hxdet::rate_dhz());
   out += ",\"trial\":" + std::to_string((unsigned) devcfg::trial_left_s());
   if (linked) out += ",\"peer_role\":\"" + json_escape(peer_role) + "\"";
   if (extra_status) out += "," + extra_status();
@@ -2400,6 +2422,7 @@ static const char *test_label(const std::string &n) {
   if (n == "test_update") return "проверка обновления прошивки";
   if (n == "test_resources") return "ресурсы: память и сокеты";
   if (n == "test_tiebreak") return "тай-брейк: сброс обоих";
+  if (n == "test_hx") return "датчик HX711: надёжность подсказки";
   return nullptr;
 }
 
@@ -2509,6 +2532,36 @@ static void test_task(void *arg) {
           (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     evlog('i', "[%s] работа: %lu с с запуска", clock_stamp().c_str(), (unsigned long) (now_ms() / 1000));
     set_status(used >= CONFIG_LWIP_MAX_SOCKETS - 1 ? "Сокеты почти исчерпаны" : "Ресурсы в норме");
+  } else if (self == "test_hx") {
+    // 30 секунд, раз в секунду смотрим подсказку: она должна быть стабильной и совпадать с действительностью
+    // (датчик подключён: «ok»; отключён: «nodata»). Итог пишем в чёрный ящик тегом HX.
+    if (!hxdet::capable) {
+      evlog('i', "[%s] HX711: в этой прошивке датчика нет, тест не нужен", clock_stamp().c_str());
+      bb::key("HX", "test skipped: firmware has no HX711");
+      set_status("Тест датчика: в этой прошивке HX711 нет");
+    } else {
+      int counts[5] = {0, 0, 0, 0, 0};
+      int flips = 0, prev = -1;
+      for (int i = 0; i < 30; i++) {
+        const int c = hxdet::code();
+        counts[c]++;
+        if (prev >= 0 && c != prev) {
+          flips++;
+          bb::line("HX", "t=%ds hint %s -> %s", i, hxdet::name(prev), hxdet::name(c));
+        }
+        prev = c;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+      }
+      int dom = 0;
+      for (int c = 1; c < 5; c++) if (counts[c] > counts[dom]) dom = c;
+      const int hz = hxdet::rate_dhz();
+      bb::key("HX", "test done n=30 ok=%d nodata=%d stuck=%d sat=%d flips=%d dominant=%s total=%lu hz=%d.%d %s",
+              counts[hxdet::kOk], counts[hxdet::kNoData], counts[hxdet::kStuck], counts[hxdet::kSaturated], flips,
+              hxdet::name(dom), (unsigned long) hxdet::total, hz / 10, hz % 10, flips == 0 ? "STABLE" : "UNSTABLE");
+      evlog('i', "[%s] HX711: подсказка «%s», смен %d, отсчётов всего %lu, частота %d,%d Гц", clock_stamp().c_str(),
+            hxdet::name(dom), flips, (unsigned long) hxdet::total, hz / 10, hz % 10);
+      set_status(flips == 0 ? "Датчик: подсказка стабильна, сверьте с действительностью" : "Датчик: подсказка прыгает (нестабильна)");
+    }
   } else if (self == "test_update") {
     const UpdateInfo u = read_update_info();
     evlog('i', "[%s] обновление: платформа %s (chip_id %u), запущено из %s, следующий раздел %s",
@@ -2793,6 +2846,7 @@ static esp_err_t h_ft_start(httpd_req_t *req) {
   std::string b;
   if (req->content_len > 0 && recv_body(req, b, 60) < 0) return reply_msg(req, "Ошибка запроса");
   const bool relay = form_value(b, "relay") == "1";
+  if (devcfg::simple()) return reply_msg(req, "Недоступно в простом режиме: полному тесту нужен сосед");
   if (ft_phase != 0) return reply_msg(req, "Тест уже идёт");
   ft_set(1);
   bb::key("FT", "START %s role=%s build=%s", relay ? "by neighbor" : "by user", role_code(), bb::build.c_str());
@@ -2901,8 +2955,18 @@ static esp_err_t h_devcfg_set(httpd_req_t *req) {
 }
 
 static esp_err_t h_devcfg_confirm(httpd_req_t *req) {
+  // Роль выбирается при загрузке, поэтому смена режима вступает в силу после перезагрузки.
+  const bool mode_changed = devcfg::trial && devcfg::prev.mode != devcfg::cur.mode;
   devcfg::confirm();
-  bb::key("CFG", "confirmed");
+  bb::key("CFG", "confirmed mode=%d%s", (int) devcfg::cur.mode, mode_changed ? " (mode changed, rebooting)" : "");
+  if (mode_changed && on_reboot) {
+    set_status("Режим изменён, устройство перезагружается");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"reboot\":true,\"msg\":\"Режим изменён, устройство перезагружается\"}");
+    vTaskDelay(pdMS_TO_TICKS(250));
+    on_reboot();
+    return ESP_OK;
+  }
   set_status("Настройки подтверждены");
   return reply_msg(req, "Настройки подтверждены");
 }

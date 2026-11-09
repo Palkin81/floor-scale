@@ -1,23 +1,17 @@
+# Экран на ESP32 DevKit (основная плата экрана).
+# Логика общая: packages/common.yaml и packages/screen.yaml; здесь только плата.
 substitutions:
-  ap_ip: "192.168.4.1"      # общий адрес точки (проверка варианта C, см. снимок)
+  board: esp32dev
+  esp_variant: esp32
 
 packages:
   common: !include packages/common.yaml
+  screen: !include packages/screen.yaml
 
 esphome:
   name: floor-screen
   friendly_name: screen
 
-script:
-  - id: device_setup
-    then:
-      - lambda: |-
-          ui::peer_host = "floor-scale.local";
-
 esp32:
-  board: esp32dev
-
-sensor:
-  - platform: wifi_signal
-    name: signal
-    update_interval: 30s
+  board: ${board}
+  variant: ${esp_variant}
