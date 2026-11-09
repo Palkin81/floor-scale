@@ -18,7 +18,7 @@ packages:
 
 esphome:
   name: floor-screen
-  friendly_name: device
+  friendly_name: Floor ESP32
 
 esp32:
   board: ${board}
